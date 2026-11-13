@@ -4,6 +4,23 @@ from lib.classes.tts_engines.common.narration import NaturalNarration
 
 #sys.stderr = StdoutFilter(sys.stdout)
 
+def _silence_max_length_notice()->None:
+    # _infer_once() caps every generation with max_new_tokens (runaway guard) while Coqui
+    # passes its own max_length: transformers then warns on every chunk that max_new_tokens
+    # takes precedence, which is exactly what is wanted. Only that notice is dropped.
+    import logging, warnings
+    pattern = 'seem to have been set'
+
+    class _Drop(logging.Filter):
+        def filter(self, record):
+            return pattern not in record.getMessage()
+
+    for name in ('transformers.generation.utils', 'transformers.generation.configuration_utils', 'transformers'):
+        logging.getLogger(name).addFilter(_Drop())
+    warnings.filterwarnings('ignore', message=r'.*max_new_tokens.*max_length.*seem to have been set')
+
+_silence_max_length_notice()
+
 class XTTS(NaturalNarration, TTSUtils, TTSRegistry, name='xtts'):
 
     def __init__(self, session:DictProxy):
