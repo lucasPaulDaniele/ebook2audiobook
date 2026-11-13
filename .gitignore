@@ -21,3 +21,15 @@ models/*
 !audiobooks/gui/host/.gitkeep
 .installed
 .env
+python_env_f5/
+.device_info.json
+# voices are downloaded at install time; only the narrator voices of this fork are versioned
+voices/*
+!voices/.gitkeep
+!voices/fra/
+voices/fra/*
+!voices/fra/adult/
+voices/fra/adult/*
+!voices/fra/adult/male/
+voices/fra/adult/male/*
+!voices/fra/adult/male/ElevenLabs_MartinDupont.wav
