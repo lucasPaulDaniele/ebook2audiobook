@@ -47,6 +47,7 @@ from lib.classes.non_text_filter import NonTextFilter
 from lib.classes.epub_sections import split_spine, is_excluded as is_excluded_doc
 from lib.classes.html_tts_prep import prepare_html_for_tts, speak_inline_ordinals
 from lib.classes.natural_chunker import NaturalChunker
+from lib.classes.progressive_export import ProgressiveExporter
 #from lib.classes.redirect_console import RedirectConsole
 from lib.classes.argos_translator import ArgosTranslator
 from lib.classes.tts_manager import TTSManager
@@ -3029,6 +3030,13 @@ def convert_chapters2audio(session_id:str)->bool:
         ch_num = 0
         last_save_time = time.monotonic()
         baseline_initialized = False
+        # every finished chapter is exported right away to "<book> (en cours)"
+        exporter = None
+        if session.get('progressive_export', True) and session.get('audiobooks_dir'):
+            try:
+                exporter = ProgressiveExporter(session)
+            except Exception as e:
+                print(f'Progressive export disabled: {e}')
         msg = (f'---------<br/>'
                f"{session['filename_noext']}<br/>"
                f"A total of {total_chapters} {'block' if total_chapters <= 1 else 'blocks'} "
@@ -3064,6 +3072,8 @@ def convert_chapters2audio(session_id:str)->bool:
                         missing_sentences = _check_block_sentences(block_id, sentences)
                         if not missing_sentences:
                             print(f'Chapter {ch_num} (block {x}) — has all sentences')
+                            if exporter and not exporter.has(ch_num):
+                                exporter.add_chapter(ch_num, chapter_audio_file, chapter_title_of(sentences, ch_num))
                             cnt = len(valid_idx)
                             global_sent += cnt
                             t.update(cnt)
@@ -3128,6 +3138,8 @@ def convert_chapters2audio(session_id:str)->bool:
                     if not combine_audio_sentences(session_id, chapter_audio_file, block_id, block_len):
                         show_alert(session_id, {'type': 'warning', 'msg': 'combine_audio_sentences() failed!'})
                         return False
+                    if exporter:
+                        exporter.add_chapter(ch_num, chapter_audio_file, chapter_title_of(sentences, ch_num))
             #blocks_current['block_resume'] = 0
             #blocks_current['sentence_resume'] = 0
             session['blocks_current'] = blocks_current
@@ -3146,6 +3158,26 @@ def convert_chapters2audio(session_id:str)->bool:
         # is the only way to cover them all.
         if not conversion:
             unload_tts_manager(tts_manager)
+
+CHAPTER_LEAD_IN_S = 1.0
+CHAPTER_TAIL_S = 1.5
+
+def chapter_silence_files(work_dir:str, model_file:str|Path)->tuple[str|None, str|None]:
+    # silences in the exact format of the sentence files, so the concat stays a stream copy
+    try:
+        import soundfile as sf
+        import numpy as np
+        info = sf.info(str(model_file))
+        files = []
+        for name, seconds in (('lead_in', CHAPTER_LEAD_IN_S), ('tail', CHAPTER_TAIL_S)):
+            path = os.path.join(work_dir, f'_chapter_{name}_{info.samplerate}_{info.channels}_{info.subtype}.{default_audio_proc_format}')
+            if not os.path.exists(path):
+                sf.write(path, np.zeros((int(seconds * info.samplerate), info.channels), dtype='float32'), info.samplerate, subtype=info.subtype)
+            files.append(path)
+        return files[0], files[1]
+    except Exception as e:
+        print(f'chapter_silence_files() error: {e}')
+        return None, None
 
 def combine_audio_sentences(session_id:str, file:str, block_id:str, sentence_count:int)->bool:
     try:
@@ -3174,11 +3206,19 @@ def combine_audio_sentences(session_id:str, file:str, block_id:str, sentence_cou
             return False
         concat_dir = session['process_dir']
         concat_list = os.path.join(concat_dir, 'concat_list_sentences.txt')
+        # silence around every chapter: players (VLC…) need a moment to open the audio
+        # output and eat the first syllable of a chapter starting at 0 s, and the listener
+        # needs a breath between two chapters
+        lead_in, tail = chapter_silence_files(concat_dir, selected_files[0])
         with open(concat_list, 'w') as f:
+            if lead_in:
+                f.write(f"file '{Path(lead_in).as_posix()}'\n")
             for path in selected_files:
                 if session['cancellation_requested']:
                     return False
                 f.write(f"file '{path.as_posix()}'\n")
+            if tail:
+                f.write(f"file '{Path(tail).as_posix()}'\n")
         result = assemble_audio_chunks(concat_list, file, session['is_gui_process'])
         if not result:
             error = 'combine_audio_sentences() FFmpeg concat failed.'
@@ -3190,6 +3230,43 @@ def combine_audio_sentences(session_id:str, file:str, block_id:str, sentence_cou
     except Exception as e:
         DependencyError(e)
         return False
+
+CHAPTER_EXCERPT_CHARS = 38
+
+def chapter_title_of(sentences:list[str], ch_num:int|None=None)->str:
+    # the chapter title is its heading (the first spoken line, closed by a [pause]); a short
+    # heading followed by a second one (part title merged by split_spine(), series name then
+    # subtitle: "Doux chagrins" / "Jadis, il y a fort longtemps…") is completed with it.
+    # A chapter without heading is named "Chapitre N — first words…": its first sentence
+    # would make an unreadable chapter name. The name is only metadata, nothing is spoken.
+    def _clean(s:str)->str:
+        s = ' '.join(SML_TAG_PATTERN.sub(' ', s).split()).lstrip(' .;:…').rstrip(' .;:')
+        return s[:1].upper() + s[1:]
+
+    spoken = [s for s in sentences if any(c.isalnum() for c in SML_TAG_PATTERN.sub(' ', s))]
+
+    def _is_heading(k:int)->bool:
+        # the last chunk ends with the [pause] closing the chapter, it is not a heading
+        return k < len(spoken) - 1 and bool(re.search(r'\[pause\]', spoken[k]))
+
+    if not spoken:
+        return f'Chapitre {ch_num}' if ch_num else ''
+    if _is_heading(0) or ch_num is None:
+        title = _clean(spoken[0])
+        if len(title) < 40 and _is_heading(0) and _is_heading(1):
+            title = f'{title} — {_clean(spoken[1])}'
+        return title
+    return f'Chapitre {ch_num} — {chapter_excerpt(_clean(spoken[0]))}'
+
+def chapter_excerpt(text:str, max_chars:int=CHAPTER_EXCERPT_CHARS)->str:
+    # first words of a text, cut on a word boundary: "Zachary Ezra Rawlins est assis par…"
+    words = text.split()
+    out = []
+    for w in words:
+        if out and len(' '.join(out + [w])) > max_chars:
+            break
+        out.append(w)
+    return ' '.join(out).rstrip(' ,;:.!?…—-') + '…'
 
 def combine_audio_chapters(session_id:str)->list[str]|None:
     
@@ -3455,7 +3532,7 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 print(error)
                 return None
             chapter_files.append(fname)
-            chapter_titles.append(block['sentences'][0])
+            chapter_titles.append(chapter_title_of(block['sentences'], len(chapter_files)))
             chapter_positions.append(x)
         if len(chapter_files) == 0:
             print('No block files exist!')
