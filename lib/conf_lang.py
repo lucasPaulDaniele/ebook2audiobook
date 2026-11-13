@@ -39,7 +39,7 @@ punctuation_switch = {
     '„': '"',   # German-style quote
 
     # Dashes, underscores & Hyphens that might cause weird pauses
-    '–': '.',  # En dash (Unicode U+2013)
+    '–': ',',  # En dash (Unicode U+2013), an incise: a short pause, not a sentence end
     "_": " ",   # U+005F LOW LINE
     "‗": " ",   # U+2017 DOUBLE LOW LINE
     "¯": " ",   # U+00AF MACRON (technically an overline)
@@ -81,7 +81,7 @@ punctuation_switch = {
     '¶': '-',  # Pilcrow (paragraph mark) U+0086
 
     # Global replacement
-    '—': '.',
+    '—': ',',  # Em dash: incise or dialogue turn (leading dashes are removed earlier)
     '(': ',',
     ')': ','
 }
@@ -168,6 +168,18 @@ default_clause_split_words = [
 # Add language-specific connector lists here as they are reviewed. An entry overrides
 # the legacy fallback for that language without changing languages not yet covered.
 language_clause_split_words = {}
+
+# languages writing "1,83" for 1.83 (the comma is the decimal separator)
+decimal_comma_languages = {
+    'fra', 'deu', 'spa', 'ita', 'por', 'nld', 'rus', 'pol', 'ces', 'tur', 'hun', 'ron', 'swe',
+    'dan', 'nob', 'fin', 'ell', 'ukr', 'bul', 'hrv', 'srp', 'slk', 'slv', 'est', 'lav', 'lit', 'cat'
+}
+
+# word read between the two numbers of a range written with a dash ("pages 19-32")
+number_range_words = {
+    'fra': 'à', 'eng': 'to', 'deu': 'bis', 'spa': 'a', 'ita': 'a', 'por': 'a', 'nld': 'tot',
+    'pol': 'do', 'ces': 'až', 'rus': 'до', 'tur': 'ile'
+}
 
 chars_remove = [
     '\\', '|', '©', '®', '™',
@@ -526,7 +538,18 @@ abbreviations_mapping = {
         "bd.": "boulevard",
         "etc.": "et cetera",
         "ex.": "exemple",
-        "c.-à-d.": "c'est-à-dire"
+        "c.-à-d.": "c'est-à-dire",
+        "Dr": "Docteur",
+        "Mme": "Madame",
+        "Mmes": "Mesdames",
+        "Mlle": "Mademoiselle",
+        "Mlles": "Mesdemoiselles",
+        "P.-S.": "Post-scriptum",
+        "N.d.t.": "Note du traducteur",
+        "N.d.T.": "Note du traducteur",
+        "stp": "s'il te plaît",
+        "svp": "s'il vous plaît",
+        "cf.": "voir"
     },
     "spa": {
         "Sr.": "Señor",
@@ -662,7 +685,7 @@ abbreviations_mapping = {
 
 chapter_word_mapping = {
     "eng": ["chapter", "part", "psalm", "section", "paragraph", "article", "tome"],
-    "fra": ["chapitre", "partie", "psaume", "section", "paragraphe", "article", "tome"],
+    "fra": ["chapitre", "partie", "psaume", "section", "paragraphe", "article", "tome", "livre", "interlude"],
     "spa": ["capítulo", "parte", "salmo", "sección", "párrafo", "artículo", "tomo"],
     "deu": ["Kapitel", "Teil", "Psalm", "Abschnitt", "Absatz", "Artikel", "Band"],
     "ita": ["capitolo", "parte", "salmo", "sezione", "paragrafo", "articolo", "tomo"],

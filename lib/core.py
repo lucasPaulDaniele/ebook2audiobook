@@ -2181,12 +2181,15 @@ def set_formatted_number(text:str, lang:str, lang_iso1:str, is_num2words_compat:
     # handle optional range with dash/en dash/em dash between numbers, and allow trailing punctuation
     number_re = re.compile(
         r'(?<!\w)'
-        r'(\d{1,18}(?:,\s*\d{1,18})*(?:\.\d{1,12})?)'      # first number
+        r'(\d{1,18}(?:,\d{3})*(?:\.\d{1,12})?)'            # first number
         r'(?:\s*([-–—])\s*'                                # dash type
-        r'(\d{1,18}(?:,\s*\d{1,18})*(?:\.\d{1,12})?))?'    # optional second number
+        r'(\d{1,18}(?:,\d{3})*(?:\.\d{1,12})?))?'          # optional second number
         r'([^\w\s]*)',                                     # optional trailing punctuation
         re.UNICODE
     )
+    if lang in decimal_comma_languages:
+        # "1,83 mètre": the comma is the decimal separator, "1,830" is not a thousand
+        text = re.sub(r'(?<![\d,.])(\d{1,15}),(\d{1,12})(?![\d,])', r'\1.\2', text)
 
     def _normalize_commas(num_str:str)->str:
         # ormalize number string to standard comma format: 1,234,567
@@ -2217,6 +2220,15 @@ def set_formatted_number(text:str, lang:str, lang_iso1:str, is_num2words_compat:
 
         if is_num2words_compat:
             new_lang_iso1 = lang_iso1.replace('zh', 'zh_CN')
+            if isinstance(num, float) and lang in decimal_comma_languages and '.' in clean:
+                # "1,83" is read "un virgule quatre-vingt-trois", not digit by digit
+                int_part, dec_part = clean.lstrip('+-').split('.', 1)
+                comma_word = language_math_phonemes.get(lang, {}).get(',', ',')
+                zeros = len(dec_part) - len(dec_part.lstrip('0'))
+                zero_word = num2words(0, lang=new_lang_iso1)
+                dec_words = ' '.join([zero_word] * zeros + ([num2words(int(dec_part), lang=new_lang_iso1)] if dec_part.strip('0') else []))
+                sign = num2words(-1, lang=new_lang_iso1).split()[0] + ' ' if clean.startswith('-') else ''
+                return f'{sign}{num2words(int(int_part or 0), lang=new_lang_iso1)} {comma_word} {dec_words}'.strip()
             return num2words(num, lang=new_lang_iso1)
         else:
             phoneme_map = language_math_phonemes.get(
@@ -2231,6 +2243,9 @@ def set_formatted_number(text:str, lang:str, lang_iso1:str, is_num2words_compat:
         second_num = _clean_single_num(match.group(3)) if match.group(3) else ''
         trailing = match.group(4) or ''
         if second_num:
+            range_word = number_range_words.get(lang)
+            if range_word:
+                return f'{first_num} {range_word} {second_num}{trailing}'
             return f'{first_num}{dash_char}{second_num}{trailing}'
         else:
             return f'{first_num}{trailing}'
@@ -2339,6 +2354,9 @@ def math2words(text:str, lang:str, lang_iso1:str, tts_engine:str, is_num2words_c
 
     def _repl_ambiguous(match:re.Match)->str:
         # handles "num SYMBOL num" and "SYMBOL num"
+        if match.group(2) == '-' and range_word and not re.search(r'\s', match.group(0)):
+            # a dash glued between two numbers is a range: pages 19-32, 2011-2012
+            return f'{match.group(1)} {range_word} {match.group(3)}'
         if match.group(2) and match.group(2) in ambiguous_replacements:
             return f'{match.group(1)} {ambiguous_replacements[match.group(2)]} {match.group(3)}'
         if match.group(3) and match.group(3) in ambiguous_replacements:
@@ -2355,9 +2373,11 @@ def math2words(text:str, lang:str, lang_iso1:str, tts_engine:str, is_num2words_c
         # If num2words isn't available/compatible, keep original token as-is.
         return m.group(0)
 
+    range_word = number_range_words.get(lang)
     # Matches any digits + optional space/NBSP + st/nd/rd/th, not glued into words.
     re_ordinal = re.compile(r'(?<!\w)(\d+)(?:\s|\u00A0)*(?:st|nd|rd|th)(?!\w)')
-    text = re.sub(r'(\d)\)', r'\1 : ', text)
+    # list numbering "1) item" only at the start of an item, not "(numéro 10) a commencé"
+    text = re.sub(r'(?m)(^|[.:;]\s+)(\d{1,3})\)\s', r'\1\2 : ', text)
     text = re_ordinal.sub(_ordinal_to_words, text)
     # Symbol phonemes
     ambiguous_symbols = {"-", "/", "*", "x"}
@@ -2435,8 +2455,11 @@ def roman2number(text:str)->str:
         key=len,
         reverse=True
     )
+    # the chapter word is case-insensitive, the numeral is not: "partie d'une" must not
+    # become "partie cinq cents'une"; a lowercase numeral ("interlude ii") is only read as
+    # one with the small letters i, v, x and right before a punctuation or the end
     chapter_words_re = re.compile(
-        rf'\b({"|".join(map(re.escape, chapter_words))})\s+([IVXLCDM]+)\b',
+        rf'\b({"|".join(map(re.escape, chapter_words))})\s+((?-i:[IVXLCDM]+|[ivx]+(?=[\s.,;:!?…\[]|$)))(?![\p{{L}}\p{{N}}\'’])',
         re.IGNORECASE | re.UNICODE
     )
     text = re.sub(
@@ -2620,8 +2643,19 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
         token = match.group(1)
         for k, expansion in mapping.items():
             if token.lower() == k.lower():
+                # "etc." closing a sentence: the period also ends the sentence, keep it
+                if k.endswith('.') and re.match(r'\s*(?:$|[\p{Lu}«"“\[])', match.string[match.end():]):
+                    return expansion + '.'
                 return expansion
         return token  # fallback
+
+    def _reduce_hard(match:re.Match)->str:
+        # keep the most expressive mark of a run: "?." must stay a question
+        run = match.group(0)
+        for mark in ('?', '!', '…'):
+            if mark in run:
+                return mark + ' '
+        return match.group(2) + ' '
             
     # Remove emojis
     emoji_pattern = re.compile(f"[{''.join(emojis_list)}]+", flags=re.UNICODE)
@@ -2636,6 +2670,7 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
             flags=re.IGNORECASE
         )
         text = pattern.sub(_replace, text)
+    text = re.sub(r'\bO\.\s?K\.', 'Okay', text)
     # This regex matches sequences like a., c.i.a., f.d.a., m.c., etc…
     pattern = re.compile(r'\b(?:[a-zA-Z]\.){1,}[a-zA-Z]?\b\.?')
     # uppercase acronyms
@@ -2648,16 +2683,22 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     text = re.sub(pattern, f" {sml_token('pause')} ", text)
     # Replace single newlines ("\n" or "\r") with spaces
     text = re.sub(r'\r\n|\r|\n', ' ', text)
+    # the '...' key of punctuation_switch cannot match inside a character class
+    text = re.sub(r'\.{3,}', '…', text)
     # Replace punctuations causing hallucinations
     pattern = f"[{''.join(map(re.escape, punctuation_switch.keys()))}]"
     text = re.sub(pattern, lambda match: punctuation_switch.get(match.group(), match.group()), text)
+    # a soft punctuation right after a sentence end is an artefact of the switches above
+    # ("(…celle-ci.) Cela" -> "celle-ci., Cela"), it would add a pause without meaning
+    text = re.sub(r'([.!?…])(?:\s*[,;:])+', r'\1', text)
+    # and a soft one right before it: ", ." left by an incise closing the sentence
+    text = re.sub(r'(?:[,;:]\s*)+([.!?…])', r'\1', text)
     # remove unwanted chars
     chars_remove_table = str.maketrans({ch: ' ' for ch in chars_remove})
     text = text.translate(chars_remove_table)
-    # replace double quotes by a comma if no punctuation precedes it
-    text = re.sub(r'\s*"\s*', '"', text)
-    text = re.sub(r'(?<=[\p{L}\p{N}])"(?=[\p{L}\p{N}]|$)', ', ', text)
-    text = re.sub(r'"', '', text)
+    # quotes are typography: a quoted word must not get pauses around it
+    # ("le mot «minotaure»" read "le mot, minotaure,")
+    text = re.sub(r'"', ' ', text)
     # Replace multiple and spaces with single space
     text = re.sub(r'\s+', ' ', text)
     # Replace ok by 'Owkey'
@@ -2665,7 +2706,7 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     # Escape special characters in the punctuation list for regex
     pattern = '|'.join(map(re.escape, punctuation_split_hard_set))
     # Reduce multiple consecutive punctuations hard
-    text = re.sub(rf'(\s*({pattern})\s*)+', r'\2 ', text).strip()
+    text = re.sub(rf'(\s*({pattern})\s*)+', _reduce_hard, text).strip()
     # Escape special characters in the punctuation list for regex
     pattern = '|'.join(map(re.escape, punctuation_split_soft_set))
     # Reduce multiple consecutive punctuations soft

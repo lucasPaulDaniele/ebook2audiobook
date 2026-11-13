@@ -19,6 +19,7 @@ from .conf_lang import (
     punctuation_list_set, punctuation_split_hard, punctuation_split_hard_set,
     punctuation_split_soft, punctuation_split_soft_set, punctuation_switch,
     default_clause_split_words, language_clause_split_words,
+    decimal_comma_languages, number_range_words,
     specialchars_mapping, chars_remove, year_to_decades_languages,
 )
 
@@ -50,6 +51,7 @@ __all__ = [
     "punctuation_list_set", "punctuation_split_hard", "punctuation_split_hard_set",
     "punctuation_split_soft", "punctuation_split_soft_set", "punctuation_switch",
     "default_clause_split_words", "language_clause_split_words",
+    "decimal_comma_languages", "number_range_words",
     "specialchars_mapping", "chars_remove", "year_to_decades_languages",
     
     # from conf_models
