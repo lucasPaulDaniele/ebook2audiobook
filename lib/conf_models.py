@@ -86,7 +86,11 @@ default_engine_settings = {
         "top_k": 40,
         "top_p": 0.95,
         "speed": 1.0,
-        #"gpt_cond_len": 512,
+        # conditioning: 30 s of reference in 4 s chunks gives the GPT the narration style,
+        # the coqui defaults only look at the first 6 s
+        "gpt_cond_len": 30,
+        "gpt_cond_chunk_len": 4,
+        "max_ref_length": 60,
         #"gpt_batch_size": 1,
         # get_sentences() already cuts at prosodic boundaries under the language limit;
         # coqui's own splitting would glue its pieces back with no pause

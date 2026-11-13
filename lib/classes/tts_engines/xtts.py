@@ -136,6 +136,17 @@ class XTTS(NaturalNarration, TTSUtils, TTSRegistry, name='xtts'):
     # XTTS GPT produces 21.53 audio codes per second (22050 Hz / hop 1024)
     AUDIO_CODES_PER_S = 22050 / 1024
 
+    def _conditioning_params(self)->dict:
+        cfg = default_engine_settings[TTS_ENGINES['XTTS']]
+        params = {}
+        for key in ('gpt_cond_len', 'gpt_cond_chunk_len', 'max_ref_length'):
+            value = self.session.get(f'xtts_{key}') or cfg.get(key)
+            if value:
+                params[key] = int(value)
+        if 'gpt_cond_len' in params and 'gpt_cond_chunk_len' in params:
+            params['gpt_cond_chunk_len'] = min(params['gpt_cond_chunk_len'], params['gpt_cond_len'])
+        return params
+
     def _infer_once(self, text:str, seed:int, expected_s:float)->Any:
         import math
         import torch
@@ -195,7 +206,10 @@ class XTTS(NaturalNarration, TTSUtils, TTSRegistry, name='xtts'):
                             if self.speaker in default_engine_settings[TTS_ENGINES['XTTS']]['voices'].keys():
                                 self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.xtts_speakers[default_engine_settings[TTS_ENGINES['XTTS']]['voices'][self.speaker]].values()
                             else:
-                                self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.engine.get_conditioning_latents(audio_path=[self.params['current_voice']], load_sr=24000, sound_norm_refs=True)
+                                self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.engine.get_conditioning_latents(
+                                    audio_path=[self.params['current_voice']], load_sr=24000, sound_norm_refs=True,
+                                    **self._conditioning_params()
+                                )
                             self.params['latent_embedding'][self.params['current_voice']] = self.params['gpt_cond_latent'], self.params['speaker_embedding']
                         try:
                             part_tensor, error = self._synthesize_checked(text_chunk)
