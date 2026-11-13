@@ -149,6 +149,51 @@ class ProgressiveExporter:
             if os.path.exists(f):
                 os.remove(f)
 
+    def export_range(self, first:int, last:int, target:str, title:str)->str|None:
+        """One chaptered m4b of chapters first..last (stream copy of the chapter files)."""
+        from lib.classes.tts_engines.common.audio import get_audio_duration
+        try:
+            chapters = [(n, *self.chapters[n]) for n in range(first, last + 1) if self.has(n)]
+            missing = [n for n in range(first, last + 1) if not self.has(n)]
+            if missing or not chapters:
+                print(f'[partie] chapitres absents de l\'export : {missing}')
+                return None
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            concat = target + '.concat.txt'
+            meta = target + '.meta.txt'
+            with open(concat, 'w', encoding='utf-8') as f:
+                for _, path, _ in chapters:
+                    f.write(f"file '{path.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+            start = 0
+            with open(meta, 'w', encoding='utf-8') as f:
+                f.write(';FFMETADATA1\n')
+                f.write(f'title={_ffmeta_escape(title)}\n')
+                f.write(f'album={_ffmeta_escape(self.book_title)}\n')
+                f.write('genre=Audiobook\n')
+                if self.metadata.get('creator'):
+                    f.write(f"artist={_ffmeta_escape(self.metadata['creator'])}\n")
+                for _, path, ch_title in chapters:
+                    dur = int(get_audio_duration(path) * 1000)
+                    f.write(f'[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={start + dur}\ntitle={_ffmeta_escape(ch_title)}\n')
+                    start += dur
+            tmp = target + '.tmp.m4b'
+            subprocess.run([
+                self.ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
+                '-f', 'concat', '-safe', '0', '-i', concat, '-f', 'ffmetadata', '-i', meta,
+                '-map', '0:a', '-map_metadata', '1', '-map_chapters', '1', '-c', 'copy',
+                '-movflags', '+faststart', '-f', 'mp4', tmp
+            ], check=True)
+            self._add_cover(tmp)
+            os.replace(tmp, target)
+            for f in (concat, meta):
+                if os.path.exists(f):
+                    os.remove(f)
+            print(f'[partie] {target} : {len(chapters)} chapitres, {start / 3600000:.2f} h')
+            return target
+        except Exception as e:
+            print(f'[partie] export impossible : {e}')
+            return None
+
     def _add_cover(self, path:str)->None:
         if not self.cover or not os.path.exists(self.cover):
             return

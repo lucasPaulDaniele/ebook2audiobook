@@ -48,6 +48,9 @@ from lib.classes.epub_sections import split_spine, is_excluded as is_excluded_do
 from lib.classes.html_tts_prep import prepare_html_for_tts, speak_inline_ordinals
 from lib.classes.natural_chunker import NaturalChunker
 from lib.classes.progressive_export import ProgressiveExporter
+from lib.classes.asr_verifier import AsrVerifier, CONFIRM_CER as ASR_CONFIRM_CER, same_transcription
+from lib.classes.asr_verifier import _append_jsonl as asr_jsonl_append
+from lib.classes import cadence
 #from lib.classes.redirect_console import RedirectConsole
 from lib.classes.argos_translator import ArgosTranslator
 from lib.classes.tts_manager import TTSManager
@@ -2969,10 +2972,369 @@ def convert_chapters2audio(session_id:str)->bool:
     def _count_sentences(sentences:list)->int:
         return sum(1 for s in sentences if any(c.isalnum() for c in s.strip()))
 
+    def _asr_chunks(block_id:str, sentences:list)->list[dict]:
+        block_dir = os.path.join(session['sentences_dir'], block_id)
+        return [
+            {'j': j, 'wav': os.path.join(block_dir, f'{j}.{default_audio_proc_format}'), 'text': ' '.join(SML_TAG_PATTERN.sub(' ', s).split())}
+            for j, s in enumerate(sentences) if any(c.isalnum() for c in s)
+        ]
+
+    def _valid_take(path:str)->bool:
+        try:
+            import soundfile as sf
+            return sf.info(path).frames > 0
+        except Exception:
+            return False
+
+    def _variant(wav:str, tag:str)->str:
+        # "<j>.flac" -> "<j>.<tag>.flac": takes live next to the chunk, ignored by the concat
+        return wav[:-len(default_audio_proc_format) - 1] + f'.{tag}.{default_audio_proc_format}'
+
+    def _cadence_retakes(ch_num:int, j:int, kind:str, wav:str, sentence:str, block_voice:str|None)->None:
+        # titles and chapter ends must close on a falling tune: when the take does not fall,
+        # up to cadence.MAX_TAKES more takes are drawn and the most falling one is kept.
+        # Every take stays on disk (".cadK") until the part correction, where Whisper may
+        # need them (a title must also be read right)
+        c = cadence.measure(wav)
+        entry = {'wav': wav, 'ch_num': ch_num, 'j': j, 'kind': kind, 'before': c}
+        # an unmeasurable cadence (one or two words) is left alone: new takes of a single
+        # word are where XTTS hallucinates the most ("Chaussures." -> "C'est un homme")
+        if c is None or cadence.falls(c):
+            entry.update(after=c, take=0, takes=0)
+            asr_jsonl_append(cadence_log, entry)
+            return
+        shutil.copyfile(wav, _variant(wav, 'cad0'))
+        best = (cadence.rank(c), 0, c)
+        drawn = 0
+        for k in range(1, cadence.MAX_TAKES + 1):
+            take = _variant(wav, f'cad{k}')
+            if not _valid_take(take):
+                tts_manager.engine.params['seed_offset'] = 104729 * k
+                ok, err = tts_manager.convert_sentence2audio(take, sentence, block_voice=block_voice)
+                tts_manager.engine.params['seed_offset'] = 0
+                if not ok:
+                    continue
+            drawn = k
+            ck = cadence.measure(take)
+            if cadence.rank(ck) < best[0]:
+                best = (cadence.rank(ck), k, ck)
+            if cadence.falls(ck):
+                break
+        if best[1]:
+            shutil.copyfile(_variant(wav, f'cad{best[1]}'), wav)
+        entry.update(after=best[2], take=best[1], takes=drawn)
+        asr_jsonl_append(cadence_log, entry)
+        print(f"[cadence] ch {ch_num} {kind} troncon {j} : ne descendait pas {c} -> "
+              f"{'essai ' + str(best[1]) if best[1] else 'original garde'} sur {drawn}, "
+              f"{'DESCEND' if cadence.falls(best[2]) else 'ne descend toujours pas'} {best[2]}", flush=True)
+
+    def _gen_takes(items:list[dict], ks:range, k_part:int, label:str)->list[dict]:
+        # repair takes with new seeds; takes already on disk (interrupted run) are reused
+        tts = None
+        takes = []
+        for i, b in enumerate(items, 1):
+            _, block = by_id[b['block_id']]
+            sentence = block['sentences'][b['j']].strip()
+            block_voice = block.get('voice') or session.get('voice')
+            for k in ks:
+                take = _variant(b['wav'], f'take{k}')
+                if not _valid_take(take):
+                    if tts is None:
+                        tts = TTSManager(session)
+                    tts.engine.params['seed_offset'] = 7919 * k
+                    ok, err = tts.convert_sentence2audio(take, sentence, block_voice=block_voice)
+                    if not ok:
+                        continue
+                takes.append({'wav': take, 'text': b['text'], 'orig': b['wav'], 'stage': label})
+            print(f'[verif] partie {k_part} {label} {i}/{len(items)} : {len(ks)} essais prets', flush=True)
+        if tts is not None:
+            tts.engine.params['seed_offset'] = 0
+            unload_tts_manager(tts)
+        return takes
+
+    def _repair(bad:list[dict], k_part:int, again:set)->tuple[int, set]:
+        """Repairs the confirmed bad chunks of one part. Returns (repaired count, touched chapters)."""
+        attempted = {r.get('wav') for r in asr_verifier.repairs()}
+        if again:
+            bad = [b for b in bad if (b['ch_num'], b['j']) in again]
+            ks = range(AsrVerifier.REPAIR_TAKES + 1, AsrVerifier.REPAIR_TAKES + 1 + again_takes)
+            print(f'[verif] seconde chance manuelle : {len(bad)} troncon(s), {again_takes} nouveaux essais chacun', flush=True)
+        else:
+            # a chunk already through a repair keeps its best take, the deterministic seeds
+            # would only draw the same takes again
+            bad = [b for b in bad if b['wav'] not in attempted]
+            ks = range(1, AsrVerifier.REPAIR_TAKES + 1)
+        if not bad:
+            return 0, set()
+        kinds = {}
+        for b in bad:
+            _, block = by_id[b['block_id']]
+            kinds[b['wav']] = cadence.cadence_targets(block['sentences']).get(b['j'])
+        takes = _gen_takes(bad, ks, k_part, 'reparation')
+        # the current take is a candidate too: cutting its babbling tail may be the repair
+        for b in bad:
+            orig_copy = _variant(b['wav'], 'take0')
+            shutil.copyfile(b['wav'], orig_copy)
+            takes.append({'wav': orig_copy, 'text': b['text'], 'orig': b['wav'], 'stage': 'original'})
+        # titles / chapter ends: the cadence takes drawn during the synthesis are candidates too
+        for b in bad:
+            if kinds[b['wav']]:
+                for k in range(0, cadence.MAX_TAKES + 1):
+                    cad = _variant(b['wav'], f'cad{k}')
+                    if _valid_take(cad):
+                        takes.append({'wav': cad, 'text': b['text'], 'orig': b['wav'], 'stage': 'cadence'})
+        asr_verifier.score_takes(takes)
+        second = set()
+        if not again:
+            # automatic second chance: still far from the text after the first takes
+            def _best_cer(b):
+                return min((t['cer'] for t in takes if t['orig'] == b['wav'] and 'cer' in t), default=1.0)
+            late = [b for b in bad if _best_cer(b) > AsrVerifier.SECOND_CHANCE_CER]
+            if late:
+                print(f'[verif] partie {k_part} : seconde chance automatique pour {len(late)} troncon(s), '
+                      f'{AsrVerifier.SECOND_CHANCE_TAKES} essais chacun', flush=True)
+                ks2 = range(AsrVerifier.REPAIR_TAKES + 1, AsrVerifier.REPAIR_TAKES + 1 + AsrVerifier.SECOND_CHANCE_TAKES)
+                takes2 = _gen_takes(late, ks2, k_part, 'seconde chance')
+                asr_verifier.score_takes(takes2)
+                takes += takes2
+                second = {b['wav'] for b in late}
+        repaired = 0
+        touched = set()
+        for b in bad:
+            cands = [t for t in takes if t['orig'] == b['wav'] and 'cer' in t]
+            kind = kinds[b['wav']]
+            if kind:
+                for t in cands:
+                    t['cadence'] = cadence.measure(t['wav'])
+                best = cadence.choose_take(cands, asr_confirm_cer)
+            else:
+                best = min(cands, key=lambda t: t['cer']) if cands else None
+            fixed = best is not None and best['cer'] < b['cer']
+            hyps2 = [t['asr'] for t in cands if t['stage'] == 'seconde chance']
+            probable_fp = b['wav'] in second and same_transcription(hyps2) and not (fixed and best['cer'] <= asr_confirm_cer)
+            if fixed:
+                if os.path.abspath(best['wav']) != os.path.abspath(b['wav']):
+                    shutil.copyfile(best['wav'], b['wav'])
+                repaired += 1
+                touched.add(b['ch_num'])
+                asr_verifier.record_result(b['wav'], best['cer'], best['asr'])
+            if again or b['wav'] in second:
+                print(f"[verif] seconde chance ch {b['ch_num']} troncon {b['j']} : CER {b['cer']:.2f} -> "
+                      f"{best['cer'] if best else float('nan'):.2f} " + ('REPARE' if fixed else 'inchange')
+                      + (' (probable faux positif de Whisper)' if probable_fp else '') + f" | {best['asr'] if best else ''}", flush=True)
+            asr_verifier.record_repair({
+                'wav': b['wav'], 'ch_num': b['ch_num'], 'j': b['j'], 'text': b['text'], 'before_cer': b['cer'], 'before_asr': b['asr'],
+                'after_cer': best['cer'] if best else None, 'after_asr': best['asr'] if best else None, 'fixed': fixed,
+                'second_chance': b['wav'] in second or bool(again), 'probable_false_positive': probable_fp,
+                'kind': kind, 'cadence': best.get('cadence') if best else None, 'part': k_part
+            })
+            for t in cands:
+                if t['stage'] != 'cadence' and os.path.exists(t['wav']):
+                    os.remove(t['wav'])
+        return repaired, touched
+
+    def _cadence_whisper_pass(part:list[int], k_part:int)->None:
+        # titles / chapter ends retaken for their cadence during the synthesis: every take is
+        # transcribed and the kept one is the most falling of those Whisper accepts
+        groups = []
+        for ch in part:
+            block = kept[ch - 1]
+            for j, kind in cadence.cadence_targets(block['sentences']).items():
+                wav = os.path.join(session['sentences_dir'], block['id'], f'{j}.{default_audio_proc_format}')
+                cads = [_variant(wav, f'cad{k}') for k in range(0, cadence.MAX_TAKES + 1) if _valid_take(_variant(wav, f'cad{k}'))]
+                if cads:
+                    text = ' '.join(SML_TAG_PATTERN.sub(' ', block['sentences'][j]).split())
+                    groups.append((ch, j, kind, wav, [{'wav': c, 'text': text, 'orig': wav} for c in cads]))
+        if not groups:
+            return
+        print(f'[cadence] partie {k_part} : Whisper sur les prises de {len(groups)} titre(s)/fin(s) reprises pour l\'intonation', flush=True)
+        asr_verifier.score_takes([t for g in groups for t in g[4]])
+        for ch, j, kind, wav, cands in groups:
+            for t in cands:
+                t['cadence'] = cadence.measure(t['wav'])
+            best = cadence.choose_take(cands, asr_confirm_cer)
+            if best is None:
+                continue
+            shutil.copyfile(best['wav'], wav)
+            asr_verifier.record_result(wav, best['cer'], best['asr'])
+            print(f"[cadence] ch {ch} {kind} troncon {j} : prise {os.path.basename(best['wav'])} CER {best['cer']:.3f} "
+                  f"{'DESCEND' if cadence.falls(best['cadence']) else 'ne descend pas'}", flush=True)
+
+    def _parts_state_save()->None:
+        with open(parts_state_path, 'w', encoding='utf-8') as f:
+            json.dump(parts_state, f, ensure_ascii=False, indent=1)
+
+    def _delivery_name()->str:
+        title = os.environ.get('E2A_DELIVERY_NAME') or (session.get('metadata') or {}).get('title') or Path(session.get('final_name') or 'audiobook').stem
+        title = unicodedata.normalize('NFKD', title)
+        title = ''.join(c for c in title if not unicodedata.combining(c))
+        return ''.join('_' if c in '<>:"/\\|?*' else c for c in title).strip(' .')
+
+    def _deliver(path:str)->str|None:
+        # copy of a finished file to the delivery folder (E2A_DELIVERY_DIR), if any
+        dest_dir = os.environ.get('E2A_DELIVERY_DIR')
+        if not (dest_dir and path and os.path.exists(path)):
+            return None
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, os.path.basename(path))
+            shutil.copyfile(path, dest)
+            print(f'[livraison] {dest}', flush=True)
+            return dest
+        except OSError as e:
+            print(f'[livraison] copie impossible de {path} : {e}')
+            return None
+
+    def _correct_part(k_part:int, again:set|None=None)->bool:
+        """Correction of one part of the book, as soon as its last chapter is synthesised:
+        Whisper check of its chunks, repairs (+ automatic second chance), chapters rebuilt
+        with their silences, progressive export, one chaptered m4b of the part delivered."""
+        nonlocal tts_manager
+        part = parts[k_part - 1]
+        again = again or set()
+        t0 = time.time()
+        print(f"\n[verif] ===== CORRECTION DE LA PARTIE {k_part}/{len(parts)} : chapitres {part[0]} a {part[-1]} =====", flush=True)
+        show_alert(session_id, {'type': 'info', 'msg': f'Part {k_part}/{len(parts)}: Whisper check and repairs of chapters {part[0]} to {part[-1]}…'})
+        if asr_verifier:
+            asr_verifier.stop_watcher()
+        unload_tts_manager(tts_manager)
+        tts_manager = None
+        repaired, touched, n_bad = 0, set(), 0
+        if asr_verifier and not again:
+            _cadence_whisper_pass(part, k_part)
+        if asr_verifier:
+            part_ids = {kept[ch - 1]['id'] for ch in part}
+            bad = asr_verifier.verify_on_gpu(block_ids=part_ids)
+            for b in bad:
+                b['ch_num'] = by_id[b['block_id']][0]
+            n_bad = len(bad)
+            print(f'[verif] partie {k_part} : {n_bad} troncon(s) confirme(s) au-dessus de {asr_confirm_cer * 100:.0f} % de CER', flush=True)
+            repaired, touched = _repair(bad, k_part, again)
+        # final cadence of the titles / chapter ends of the part, for the report
+        cad_final = []
+        for ch in part:
+            block = kept[ch - 1]
+            for j, kind in cadence.cadence_targets(block['sentences']).items():
+                wav = os.path.join(session['sentences_dir'], block['id'], f'{j}.{default_audio_proc_format}')
+                c = cadence.measure(wav)
+                cad_final.append({'ch_num': ch, 'j': j, 'kind': kind, 'falls': cadence.falls(c), 'cadence': c,
+                                  'text': ' '.join(SML_TAG_PATTERN.sub(' ', block['sentences'][j]).split())})
+                for k in range(0, cadence.MAX_TAKES + 1):
+                    cad = _variant(wav, f'cad{k}')
+                    if os.path.exists(cad):
+                        os.remove(cad)
+        # every chapter of the part is rebuilt (repairs, chapter silences) and exported
+        for n, ch in enumerate(part, 1):
+            if again and ch not in touched:
+                continue
+            block = kept[ch - 1]
+            ch_file = os.path.join(session['chapters_dir'], f"{block['id']}.{default_audio_proc_format}")
+            if not combine_audio_sentences(session_id, ch_file, block['id'], len(block['sentences'])):
+                return False
+            if exporter:
+                exporter.add_chapter(ch, ch_file, chapter_title_of(block['sentences'], ch))
+            print(f'[verif] partie {k_part} reconstruction {n}/{len(part)}', flush=True)
+        m4b = None
+        if exporter:
+            name = f'{_delivery_name()} - partie {k_part} sur {len(parts)} (chapitres {part[0]} a {part[-1]}).m4b'
+            title = f"{exporter.book_title} — partie {k_part} sur {len(parts)} (chapitres {part[0]} à {part[-1]})"
+            m4b = exporter.export_range(part[0], part[-1], os.path.join(session['audiobooks_dir'], f'{exporter.stem} (parties)', name), title)
+        delivered = _deliver(m4b)
+        not_falling = [c for c in cad_final if not c['falls']]
+        if again:
+            done = parts_state['done'].setdefault(str(k_part), {'chapters': [part[0], part[-1]], 'bad': 0, 'repaired': 0})
+            done['again_repaired'] = done.get('again_repaired', 0) + repaired
+            done.update(m4b=delivered or m4b, cadence_targets=len(cad_final),
+                        cadence_not_falling=[[c['ch_num'], c['j'], c['kind'], c['text'][:80]] for c in not_falling])
+            _parts_state_save()
+            _deliver(_write_verification_report())
+            print(f'[verif] seconde chance partie {k_part} : {repaired} troncon(s) repare(s)', flush=True)
+            return True
+        parts_state['done'][str(k_part)] = {
+            'chapters': [part[0], part[-1]], 'bad': n_bad, 'repaired': repaired, 'm4b': delivered or m4b,
+            'cadence_targets': len(cad_final), 'cadence_not_falling': [[c['ch_num'], c['j'], c['kind'], c['text'][:80]] for c in not_falling],
+            'minutes': round((time.time() - t0) / 60, 1), 'finished': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        _parts_state_save()
+        _deliver(_write_verification_report())
+        print(f"[verif] === PARTIE {k_part}/{len(parts)} TERMINEE : chapitres {part[0]} a {part[-1]}, {repaired}/{n_bad} troncon(s) repare(s), "
+              f"{len(cad_final) - len(not_falling)}/{len(cad_final)} titres/fins descendants, {(time.time() - t0) / 60:.1f} min -> {delivered or m4b} ===", flush=True)
+        if asr_verifier and k_part < len(parts) and not again:
+            asr_verifier.start_watcher()
+        return True
+
+    def _after_chapter(ch_num:int)->None:
+        k_part = part_of_last.get(ch_num)
+        if not k_part or str(k_part) in parts_state['done']:
+            return
+        # the correction improves the book, it must never cost the hours of synthesis
+        try:
+            if not _correct_part(k_part):
+                print(f'[verif] partie {k_part} : un chapitre repare n\'a pas pu etre recombine, chapitres originaux gardes')
+        except Exception as e:
+            DependencyError(e)
+            print(f'[verif] correction de la partie {k_part} interrompue par une erreur : {e}')
+
+    def _write_verification_report()->str|None:
+        if not asr_verifier:
+            return None
+        try:
+            stem = Path(session.get('final_name') or 'audiobook').stem
+            path = os.path.join(session['audiobooks_dir'], f'{stem} - verification Whisper.txt')
+            # one entry per chunk: first verdict before any repair, last attempt after
+            merged = {}
+            for r in asr_verifier.repairs():
+                key = r.get('wav') or (r['ch_num'], r['j'])
+                if key in merged:
+                    first = merged[key]
+                    r = dict(r, before_asr=first['before_asr'], before_cer=first['before_cer'], fixed=first['fixed'] or r['fixed'],
+                             after_asr=r['after_asr'] if r['fixed'] or not first['fixed'] else first['after_asr'],
+                             after_cer=r['after_cer'] if r['fixed'] or not first['fixed'] else first['after_cer'])
+                merged[key] = r
+            entries = sorted(merged.values(), key=lambda r: (r['ch_num'], r['j']))
+            fps = [r for r in entries if r.get('probable_false_positive')]
+            remaining = [r for r in entries if (r.get('after_cer') if r.get('fixed') else r['before_cer']) > asr_confirm_cer and not r.get('probable_false_positive')]
+            done = parts_state['done']
+            lines = [f"Verification Whisper : {len(entries)} troncon(s) faux, {sum(1 for r in entries if r['fixed'])} repare(s), "
+                     f"{len(fps)} probable(s) faux positif(s) de Whisper, {len(remaining)} defaut(s) restant(s) a ecouter",
+                     f"Parties corrigees : {', '.join(sorted(done, key=int)) or 'aucune'} sur {len(parts)}", '']
+            for k in sorted(done, key=int):
+                d = done[k]
+                lines.append(f"Partie {k} (chapitres {d['chapters'][0]} a {d['chapters'][1]}) : {d['repaired']}/{d['bad']} repare(s), "
+                             f"titres/fins ne descendant pas : {len(d['cadence_not_falling'])}/{d['cadence_targets']}")
+                for ch, j, kind, text in d['cadence_not_falling']:
+                    lines.append(f'    intonation : chapitre {ch}, {kind} (troncon {j}) : {text}')
+            lines.append('')
+            if remaining:
+                lines.append('A ECOUTER (defauts restants) :')
+                for r in remaining:
+                    lines.append(f"  chapitre {r['ch_num']}, troncon {r['j']} : {r['text'][:90]}")
+                lines.append('')
+            for r in entries:
+                status = 'REPARE' if r['fixed'] else 'NON REPARE'
+                if r.get('probable_false_positive'):
+                    status += ' - probable faux positif (Whisper entend toujours la meme chose)'
+                elif r.get('second_chance'):
+                    status += ' (seconde chance)'
+                lines.append(f"Chapitre {r['ch_num']}, troncon {r['j']} : {status}")
+                lines.append(f"  texte  : {r['text']}")
+                lines.append(f"  avant  : {r['before_asr']}  (CER {r['before_cer']})")
+                if r['after_asr'] is not None:
+                    lines.append(f"  apres  : {r['after_asr']}  (CER {r['after_cer']})")
+                lines.append('')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            print(f'Verification report: {path}')
+            return path
+        except Exception as e:
+            print(f'verification report error: {e}')
+            return None
+
     session = context.get_session(session_id)
     if not (session and session.get('id', False)):
         return False
     tts_manager = None
+    asr_verifier = None
     conversion = False
     try:
         if session['cancellation_requested']:
@@ -3037,6 +3399,51 @@ def convert_chapters2audio(session_id:str)->bool:
                 exporter = ProgressiveExporter(session)
             except Exception as e:
                 print(f'Progressive export disabled: {e}')
+        # Whisper verification of the chunks (CPU watcher during the run, GPU repair at the end)
+        if session.get('asr_check', True) and session['tts_engine'] in (TTS_ENGINES['XTTS'], TTS_ENGINES['F5TTS']):
+            try:
+                asr_verifier = AsrVerifier(session, models_dir)
+                if asr_verifier.enabled:
+                    asr_verifier.start_watcher()
+                else:
+                    print('Whisper models not found in models/, verification disabled')
+                    asr_verifier = None
+            except Exception as e:
+                print(f'Whisper verification disabled: {e}')
+                asr_verifier = None
+        # the book is finished part by part (E2A_REPAIR_PARTS, 3 by default, whole chapters of
+        # about the same number of chunks): as soon as the last chapter of a part is
+        # synthesised, the part is checked by Whisper, repaired, rebuilt and delivered as its
+        # own m4b, then the synthesis goes on. Finished parts are recorded so a resumed run
+        # never does them again.
+        kept = [b for b in blocks if b['keep'] and b['text'].strip()]
+        by_id = {b['id']: (n, b) for n, b in enumerate(kept, start=1)}
+        parts = split_in_parts([_count_sentences(b['sentences']) for b in kept], int(os.environ.get('E2A_REPAIR_PARTS', '3')))
+        part_of_last = {p[-1]: k for k, p in enumerate(parts, start=1)}
+        asr_confirm_cer = ASR_CONFIRM_CER
+        cadence_on = os.environ.get('E2A_CADENCE', '1') != '0' and session['tts_engine'] in (TTS_ENGINES['XTTS'], TTS_ENGINES['F5TTS'])
+        cadence_log = os.path.join(session['process_dir'], 'cadence.jsonl')
+        # E2A_REPAIR_AGAIN=<file of "ch_num j" lines>: manual second chance for chosen chunks,
+        # with new seeds, once every part is done
+        again_file = os.environ.get('E2A_REPAIR_AGAIN')
+        again_takes = int(os.environ.get('E2A_REPAIR_AGAIN_TAKES', '8'))
+        again = set()
+        if again_file and os.path.exists(again_file):
+            for line in open(again_file, encoding='utf-8-sig'):
+                if line.split() and not line.startswith('#'):
+                    again.add(tuple(int(x) for x in line.split()[:2]))
+        parts_state_path = os.path.join(session['process_dir'], 'asr_parts_done.json')
+        parts_state = {'parts': parts, 'done': {}}
+        try:
+            with open(parts_state_path, encoding='utf-8-sig') as f:
+                saved_state = json.load(f)
+            if saved_state.get('parts') == parts:
+                parts_state['done'] = saved_state.get('done', {})
+            else:
+                print('[verif] decoupage en parties modifie : les parties deja faites seront refaites')
+        except (OSError, ValueError):
+            pass
+        print(f"[verif] {len(parts)} partie(s) : " + ', '.join(f'{k} = chapitres {p[0]} a {p[-1]}' + (' (deja faite)' if str(k) in parts_state['done'] else '') for k, p in enumerate(parts, 1)), flush=True)
         msg = (f'---------<br/>'
                f"{session['filename_noext']}<br/>"
                f"A total of {total_chapters} {'block' if total_chapters <= 1 else 'blocks'} "
@@ -3074,9 +3481,12 @@ def convert_chapters2audio(session_id:str)->bool:
                             print(f'Chapter {ch_num} (block {x}) — has all sentences')
                             if exporter and not exporter.has(ch_num):
                                 exporter.add_chapter(ch_num, chapter_audio_file, chapter_title_of(sentences, ch_num))
+                            if asr_verifier:
+                                asr_verifier.enqueue_chapter(block_id, ch_num, _asr_chunks(block_id, sentences))
                             cnt = len(valid_idx)
                             global_sent += cnt
                             t.update(cnt)
+                            _after_chapter(ch_num)
                             continue
                         show_alert(session_id, {'type': 'warning', 'msg': f'Block {x} has {len(missing_sentences)} missing audio files, reconverting…'})
                         _reset_chapter_file(block_id)
@@ -3095,6 +3505,7 @@ def convert_chapters2audio(session_id:str)->bool:
                 save_db_stamp(session_id)
                 converted = False
                 block_voice = block.get('voice') or session.get('voice')
+                cad_targets = cadence.cadence_targets(sentences) if cadence_on else {}
                 for j in range(block_len):
                     if session['cancellation_requested']:
                         msg = 'Conversion Cancelled'
@@ -3105,10 +3516,15 @@ def convert_chapters2audio(session_id:str)->bool:
                             if j == start_sentence and start_sentence > 0:
                                 show_alert(session_id, {'type': 'info', 'msg': f'*** Resuming from sentence {global_sent} ***'})
                             sentence_file = os.path.join(block_dir, f'{j}.{default_audio_proc_format}')
+                            if tts_manager is None:
+                                # unloaded by the correction of the previous part
+                                tts_manager = TTSManager(session)
                             run, error = tts_manager.convert_sentence2audio(sentence_file, sentence, block_voice=block_voice)
                             if not run:
                                 show_alert(session_id, {'type': 'warning', 'msg': error})
                                 return False
+                            if j in cad_targets:
+                                _cadence_retakes(ch_num, j, cad_targets[j], sentence_file, sentence, block_voice)
                             converted = True
                             blocks_current['sentence_resume'] = j
                             now = time.monotonic()
@@ -3140,6 +3556,24 @@ def convert_chapters2audio(session_id:str)->bool:
                         return False
                     if exporter:
                         exporter.add_chapter(ch_num, chapter_audio_file, chapter_title_of(sentences, ch_num))
+                if asr_verifier:
+                    asr_verifier.enqueue_chapter(block_id, ch_num, _asr_chunks(block_id, sentences))
+                # the chapter is complete: a resume starts after it (resuming on its last
+                # sentence would synthesise it again over a repaired or cadence-chosen take)
+                blocks_current['block_resume'] = x + 1
+                blocks_current['sentence_resume'] = 0
+                session['blocks_current'] = blocks_current
+                save_db_stamp(session_id)
+                _after_chapter(ch_num)
+            if asr_verifier and again:
+                # manual second chance on chosen chunks, part by part
+                for k_part in range(1, len(parts) + 1):
+                    try:
+                        _correct_part(k_part, again)
+                    except Exception as e:
+                        DependencyError(e)
+                        print(f'[verif] seconde chance de la partie {k_part} interrompue : {e}')
+            _deliver(_write_verification_report())
             #blocks_current['block_resume'] = 0
             #blocks_current['sentence_resume'] = 0
             session['blocks_current'] = blocks_current
@@ -3156,8 +3590,38 @@ def convert_chapters2audio(session_id:str)->bool:
         # every exit that is not a completed conversion drops the engine and evicts
         # its models: there are ten early `return False` paths in here, so a finally
         # is the only way to cover them all.
+        if asr_verifier is not None and asr_verifier.proc is not None:
+            asr_verifier.stop_watcher()
         if not conversion:
             unload_tts_manager(tts_manager)
+
+def deliver_final_files(session:Any, exported_files:list[str])->None:
+    # E2A_DELIVERY_DIR: the finished audiobook and its Whisper report are copied there
+    dest_dir = os.environ.get('E2A_DELIVERY_DIR')
+    if not dest_dir:
+        return
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        stem = Path(session.get('final_name') or 'audiobook').stem
+        report = os.path.join(session['audiobooks_dir'], f'{stem} - verification Whisper.txt')
+        for path in list(exported_files) + [report]:
+            if path and os.path.exists(path):
+                shutil.copyfile(path, os.path.join(dest_dir, os.path.basename(path)))
+                print(f'[livraison] {os.path.join(dest_dir, os.path.basename(path))}', flush=True)
+    except OSError as e:
+        print(f'[livraison] copie impossible : {e}')
+
+def split_in_parts(sizes:list[int], n_parts:int)->list[list[int]]:
+    """Chapter numbers (1-based) grouped in n_parts runs of whole chapters of about the
+    same total size (number of chunks): a chapter goes to the part where its middle falls."""
+    n_parts = max(1, n_parts)
+    total = max(1, sum(sizes))
+    parts = [[] for _ in range(n_parts)]
+    acc = 0
+    for n, size in enumerate(sizes, start=1):
+        parts[min(n_parts - 1, int((acc + size / 2) * n_parts / total))].append(n)
+        acc += size
+    return [p for p in parts if p]
 
 CHAPTER_LEAD_IN_S = 1.0
 CHAPTER_TAIL_S = 1.5
@@ -4381,6 +4845,7 @@ def finalize_audiobook(session_id:str)->tuple:
         if exported_files is None:
             return _fail('combine_audio_chapters() error: exported_files not created!')
         session['audiobook'] = exported_files[-1]
+        deliver_final_files(session, exported_files)
         if not session['is_gui_process'] and session['abs_url'] and session['abs_api_token'] and session['abs_library']:
             from lib.classes.audiobookshelf import fetch_libraries, upload_to_abs
             try:
