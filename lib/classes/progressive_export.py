@@ -28,6 +28,21 @@ def _safe(name:str, max_len:int=90)->str:
     return name[:max_len].rstrip(' .') or 'chapitre'
 
 
+def _stream_duration(path:str)->float:
+    """Duration of the audio stream as ffprobe reports it, i.e. without the AAC priming
+    frame. Chained by stream copy, a chapter starts exactly there; a decoded length is
+    1024 samples longer and makes every later chapter mark drift (~43 ms per chapter)."""
+    try:
+        out = subprocess.check_output([
+            'ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', path
+        ], text=True).strip()
+        return float(out)
+    except Exception:
+        from lib.classes.tts_engines.common.audio import get_audio_duration
+        return get_audio_duration(path)
+
+
 def _ffmeta_escape(s:str)->str:
     for ch in ('\\', '=', ';', '#', '\n'):
         s = s.replace(ch, '\\' + ch)
@@ -110,7 +125,6 @@ class ProgressiveExporter:
             f.write('\n'.join(lines) + '\n')
 
     def _rebuild_m4b(self)->None:
-        from lib.classes.tts_engines.common.audio import get_audio_duration
         ready = self._ready()
         if not ready:
             return
@@ -126,7 +140,7 @@ class ProgressiveExporter:
             if self.metadata.get('creator'):
                 f.write(f"artist={_ffmeta_escape(self.metadata['creator'])}\n")
             for _, path, title in ready:
-                dur = int(get_audio_duration(path) * 1000)
+                dur = round(_stream_duration(path) * 1000)
                 f.write(f'[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={start + dur}\ntitle={_ffmeta_escape(title)}\n')
                 start += dur
         target = os.path.join(self.out_dir, f'{self.stem} (en cours).m4b')
@@ -151,7 +165,6 @@ class ProgressiveExporter:
 
     def export_range(self, first:int, last:int, target:str, title:str)->str|None:
         """One chaptered m4b of chapters first..last (stream copy of the chapter files)."""
-        from lib.classes.tts_engines.common.audio import get_audio_duration
         try:
             chapters = [(n, *self.chapters[n]) for n in range(first, last + 1) if self.has(n)]
             missing = [n for n in range(first, last + 1) if not self.has(n)]
@@ -173,7 +186,7 @@ class ProgressiveExporter:
                 if self.metadata.get('creator'):
                     f.write(f"artist={_ffmeta_escape(self.metadata['creator'])}\n")
                 for _, path, ch_title in chapters:
-                    dur = int(get_audio_duration(path) * 1000)
+                    dur = round(_stream_duration(path) * 1000)
                     f.write(f'[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={start + dur}\ntitle={_ffmeta_escape(ch_title)}\n')
                     start += dur
             tmp = target + '.tmp.m4b'
