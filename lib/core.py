@@ -2799,7 +2799,9 @@ def block_hash(block: dict) -> str:
     return hashlib.sha1(
         '|'.join((
             (block.get('text') or '').strip(),
-            block.get('voice') or '',
+            # the voice is identified by its file name: the session works on a copy of the
+            # voice, a different folder for the same voice must not reconvert the chapter
+            os.path.basename(block.get('voice') or ''),
             block.get('tts_engine') or TTS_ENGINES['XTTS'],
             block.get('fine_tuned') or 'internal',
             json.dumps(block.get('sentences') or [], ensure_ascii=False),
@@ -4488,7 +4490,11 @@ def convert_ebook(args:dict)->tuple:
                     if voice_note:
                         msg += voice_note
                     print(msg)
-                    while True:
+                    # unattended runs (tools/run_resumable.py) answer through the environment
+                    choice = os.environ.get('E2A_RESUME_CHOICE', '').strip().lower()
+                    if choice in ('s', 'r', 'd'):
+                        print(f'[{choice}] chosen by E2A_RESUME_CHOICE')
+                    while choice not in ('s', 'r', 'd'):
                         choice = input("[s]kip / [r]esume / [d]elete and convert again: ").strip().lower()
                         if choice in ('s', 'r', 'd'):
                             break
@@ -4533,6 +4539,10 @@ def convert_ebook(args:dict)->tuple:
                                 session['voice'] = final_voice_file
                             else:
                                 error = f'VoiceExtractor.extract_voice() failed! {msg}'
+                        else:
+                            # resumed session: keep using the voice prepared by the first run,
+                            # the same audio (and path) as the chapters already converted
+                            session['voice'] = final_voice_file
             if error is None:
                 if prepare_dirs(session_id):
                     session['ebook'] = os.path.join(session['process_dir'], ebook_file)
