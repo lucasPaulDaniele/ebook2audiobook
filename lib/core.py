@@ -44,6 +44,8 @@ from lib.classes.subprocess_pipe import SubprocessPipe
 from lib.classes.vram_detector import VRAMDetector
 from lib.classes.voice_extractor import VoiceExtractor
 from lib.classes.non_text_filter import NonTextFilter
+from lib.classes.epub_sections import split_spine, is_excluded as is_excluded_doc
+from lib.classes.html_tts_prep import prepare_html_for_tts, speak_inline_ordinals
 #from lib.classes.redirect_console import RedirectConsole
 from lib.classes.argos_translator import ArgosTranslator
 from lib.classes.tts_manager import TTSManager
@@ -1309,6 +1311,61 @@ def get_cover(epubBook:EpubBook, session_id:str)->bool|str:
         DependencyError(e)
         return False
 
+class SpinePiece:
+    """Chapter cut out of a spine document, quacks like the EpubHtml used by filter_blocks()."""
+
+    def __init__(self, doc:EpubHtml, html:str):
+        self.doc = doc
+        self.id = doc.id
+        self.html = html
+
+    def get_body_content(self)->bytes:
+        return self.html.encode('utf-8')
+
+    def get_name(self)->str:
+        return self.doc.get_name()
+
+def is_scanned_book(all_docs:list[Any])->bool:
+    # OCR is for scanned books. In a text book the image-only pages are the cover, the title
+    # page or illustrations: reading their OCR aloud gives garbage ("péi À Q ami").
+    with_text = image_only = 0
+    for doc in all_docs:
+        try:
+            soup = BeautifulSoup(doc.get_body_content(), 'html.parser')
+        except Exception:
+            continue
+        if soup.get_text(strip=True):
+            with_text += 1
+        elif soup.find(['img', 'image']):
+            image_only += 1
+    scanned = image_only > with_text
+    if image_only and not scanned:
+        print(f'{image_only} image-only page(s) (cover, title page…) skipped, no OCR for a text book')
+    return scanned
+
+def split_spine_docs(all_docs:list[Any])->list[Any]:
+    # one block per chapter: split documents bundling several chapters and glue
+    # title-only pages (part titles, calibre heading page breaks) to their chapter
+    try:
+        by_id = {doc.id: doc for doc in all_docs}
+        originals = {doc.id: doc.get_content() for doc in all_docs}
+        pieces = split_spine([(doc.id, originals[doc.id]) for doc in all_docs])
+        result = []
+        for name, html, _title in pieces:
+            doc_id = name.split('#', 1)[0]
+            original = originals[doc_id]
+            original = original.decode('utf-8', errors='ignore') if isinstance(original, bytes) else original
+            if '#' not in name and html == original:
+                result.append(by_id[doc_id])
+            else:
+                result.append(SpinePiece(by_id[doc_id], html))
+        if len(result) != len(all_docs):
+            print(f'Chapters detection: {len(all_docs)} spine documents -> {len(result)} chapters')
+        return result
+    except Exception as e:
+        print(f'split_spine_docs() error: {e}, keeping the original spine')
+        return all_docs
+
 def get_blocks(session_id:str, epubBook:EpubBook)->list:
     try:
         msg = r'''
@@ -1349,6 +1406,8 @@ INTO A NEW TRAINING MODEL. YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
                 print(error)
                 return []
             title = get_ebook_title(epubBook, all_docs)
+            all_docs = split_spine_docs(all_docs)
+            allow_ocr = is_scanned_book(all_docs)
             blocks = []
             stanza_nlp = False
             if session['language'] in year_to_decades_languages:
@@ -1395,7 +1454,7 @@ INTO A NEW TRAINING MODEL. YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
                     zip_names = set(zf.namelist())
                     zip_basenames = {os.path.basename(n): n for n in zip_names}
                     for doc_idx, doc in enumerate(all_docs):
-                        text = filter_blocks(session_id, doc_idx, doc, stanza_nlp, is_num2words_compat, non_text_filter, zf, zip_names, zip_basenames)
+                        text = filter_blocks(session_id, doc_idx, doc, stanza_nlp, is_num2words_compat, non_text_filter, zf, zip_names, zip_basenames, allow_ocr)
                         if text is None:
                             error = f'Error extracting content from document #{doc_idx + 1}; aborting conversion to avoid partial output.'
                             show_alert(session_id, {"type": "warning", "msg": error})
@@ -1427,7 +1486,7 @@ INTO A NEW TRAINING MODEL. YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
         DependencyError(error)
         return []
 
-def filter_blocks(session_id:str, idx:int, doc:EpubHtml, stanza_nlp:Pipeline, is_num2words_compat:bool, non_text_filter:NonTextFilter, zf:zipfile.ZipFile=None, zip_names:set=None, zip_basenames:dict=None)->str|None:
+def filter_blocks(session_id:str, idx:int, doc:EpubHtml, stanza_nlp:Pipeline, is_num2words_compat:bool, non_text_filter:NonTextFilter, zf:zipfile.ZipFile=None, zip_names:set=None, zip_basenames:dict=None, allow_ocr:bool=True)->str|None:
 
     def _tuple_row(node:Any, last_text_char:str|None=None, in_heading:bool=False)->Generator[tuple[str, Any], None, None]|None:
         try:
@@ -1525,27 +1584,20 @@ def filter_blocks(session_id:str, idx:int, doc:EpubHtml, stanza_nlp:Pipeline, is
                 msg = 'No body found. Skip to next doc…'
                 print(msg)
                 return ''
-            # Skip known non-chapter types
-            epub_type = body.get('epub:type', '').lower()
-            if not epub_type:
-                section_tag = soup.find('section')
-                if section_tag:
-                    epub_type = section_tag.get('epub:type', '').lower()
-            excluded = {
-                'frontmatter', 'backmatter', 'toc', 'titlepage', 'colophon',
-                'acknowledgments', 'dedication', 'glossary', 'index',
-                'appendix', 'bibliography', 'copyright-page', 'landmark'
-            }
-            if any(part in epub_type for part in excluded):
+            # Skip known non-chapter types (front/back matter, navigation, epigraphs)
+            if is_excluded_doc(soup):
                 msg = 'No body part. Skip to next doc…'
                 print(msg)
                 return ''
             # remove scripts/styles
             for tag in soup(['script', 'style']):
                 tag.decompose()
+            # notes, page markers, inline formatting, superscripts, all-caps blocks, bullets
+            # and missing final punctuation are fixed on the markup, before flattening
+            prepare_html_for_tts(soup, lang)
             if not body.get_text(strip=True):
                 images = body.find_all('img') + body.find_all('image')
-                if images and zf:
+                if images and zf and allow_ocr:
                     msg = f'Doc {idx}: no text but {len(images)} image(s) detected. Running OCR…'
                     show_alert(session_id, {"type": "info", "msg": msg})
                     ocr_parts = []
@@ -1594,7 +1646,8 @@ def filter_blocks(session_id:str, idx:int, doc:EpubHtml, stanza_nlp:Pipeline, is
                     if prev_typ != typ:
                         token = sml_token(typ)
                         if text_list and text_list[-1] not in {v['static'] for v in TTS_SML.values() if 'static' in v}:
-                            sep = '; ' if prev_typ == 'heading' else ''
+                            # a heading closes its intonation like a sentence before the pause
+                            sep = '. ' if prev_typ == 'heading' and text_list[-1].rstrip()[-1:] not in punctuation_list_set else ''
                             text_list[-1] = text_list[-1] + sep + token
                         else:
                             text_list.append(token)
@@ -2711,6 +2764,8 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     pattern = '|'.join(map(re.escape, punctuation_split_soft_set))
     # Reduce multiple consecutive punctuations soft
     text = re.sub(rf'(\s*({pattern})\s*)+', r'\2 ', text).strip()
+    # ordinals written inline ("1er", "2e", "21st") before digits and letters get split
+    text = speak_inline_ordinals(text, lang)
     # Pattern 1: Add a space between UTF-8 characters and numbers
     text = re.sub(r'(?<=[\p{L}])(?=\d)|(?<=\d)(?=[\p{L}])', ' ', text)
     # Replace special chars with words
