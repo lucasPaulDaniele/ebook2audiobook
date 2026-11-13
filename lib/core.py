@@ -4455,6 +4455,12 @@ def unload_tts_manager(tts_manager:Any)->None:
         if tts_manager is not None:
             engine = getattr(tts_manager, 'engine', None)
             keys = [getattr(engine, attr, None) for attr in ('tts_key', 'tts_zs_key')]
+            # engines driving a worker process (F5-TTS) must stop it to free the GPU
+            if engine is not None and hasattr(engine, 'close'):
+                try:
+                    engine.close()
+                except Exception:
+                    pass
             tts_manager.engine = None
             engine = None
             for key in keys:
