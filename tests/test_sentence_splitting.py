@@ -131,25 +131,45 @@ def test_get_sentences_prefers_last_comma_over_earlier_clause_connector():
     assert not any('Los Angeles et' in segment and 'entendit' not in segment for segment in segments)
 
 
-def test_get_sentences_does_not_merge_short_sentences_across_sentence_boundaries():
+def _short_sentences_session(name:str, pack:bool):
     ctx = SessionContext()
-    ctx.set_session('segment_test_short_sentences')
-    session = ctx.get_session('segment_test_short_sentences')
+    ctx.set_session(name)
+    session = ctx.get_session(name)
     session['language'] = 'fra'
     session['translate_enabled'] = False
     session['translate'] = None
     session['tts_engine'] = 'XTTS'
+    session['pack_sentences'] = pack
     core.context = ctx
 
-    text = (
-        "Il regarda l'escadrille des hélicoptères; semblables à des libellules à cette distance, "
-        "ils zigzaguaient entre les nuages de fumée avant de larguer des tonnes d'eau et de retardateur "
-        "de couleur rose sur les maisons et les arbres en feu. Cela lui rappela les offensives aériennes "
-        "au Vietnam. Le bruit. La danse hésitante des appareils surchargés. Des masses d'eau traversaient "
-        "des toits en feu, de la vapeur s'élevant aussitôt dans le ciel."
-    )
 
-    segments = core.get_sentences('segment_test_short_sentences', text)
+SHORT_SENTENCES_TEXT = (
+    "Il regarda l'escadrille des hélicoptères; semblables à des libellules à cette distance, "
+    "ils zigzaguaient entre les nuages de fumée avant de larguer des tonnes d'eau et de retardateur "
+    "de couleur rose sur les maisons et les arbres en feu. Cela lui rappela les offensives aériennes "
+    "au Vietnam. Le bruit. La danse hésitante des appareils surchargés. Des masses d'eau traversaient "
+    "des toits en feu, de la vapeur s'élevant aussitôt dans le ciel."
+)
+
+
+def test_get_sentences_packs_short_sentences_and_never_cuts_them():
+    # default: short sentences are packed with their neighbours (one intonation contour
+    # per chunk sounds less choppy) and are never cut; only a sentence too long for the
+    # engine is split, at a breathing point
+    _short_sentences_session('segment_test_short_sentences_packed', True)
+    segments = core.get_sentences('segment_test_short_sentences_packed', SHORT_SENTENCES_TEXT)
+    assert segments
+    for sentence in ('Le bruit.', 'La danse hésitante des appareils surchargés.',
+                     'Cela lui rappela les offensives aériennes au Vietnam.'):
+        assert any(sentence in segment for segment in segments), segments
+    assert any('Le bruit. La danse' in segment for segment in segments), segments
+
+
+def test_get_sentences_does_not_merge_short_sentences_across_sentence_boundaries():
+    # pack_sentences off: one sentence per chunk
+    _short_sentences_session('segment_test_short_sentences', False)
+
+    segments = core.get_sentences('segment_test_short_sentences', SHORT_SENTENCES_TEXT)
     assert segments
     assert any(segment.strip() == 'Le bruit.' for segment in segments)
     assert any(segment.strip() == 'La danse hésitante des appareils surchargés.' for segment in segments)

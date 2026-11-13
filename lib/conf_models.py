@@ -88,7 +88,9 @@ default_engine_settings = {
         "speed": 1.0,
         #"gpt_cond_len": 512,
         #"gpt_batch_size": 1,
-        "enable_text_splitting": True,
+        # get_sentences() already cuts at prosodic boundaries under the language limit;
+        # coqui's own splitting would glue its pieces back with no pause
+        "enable_text_splitting": False,
         "files": ['config.json', 'model.pth', 'vocab.json', 'ref.wav'],
         "voice": default_speaker,
         "voices": {

@@ -46,6 +46,7 @@ from lib.classes.voice_extractor import VoiceExtractor
 from lib.classes.non_text_filter import NonTextFilter
 from lib.classes.epub_sections import split_spine, is_excluded as is_excluded_doc
 from lib.classes.html_tts_prep import prepare_html_for_tts, speak_inline_ordinals
+from lib.classes.natural_chunker import NaturalChunker
 #from lib.classes.redirect_console import RedirectConsole
 from lib.classes.argos_translator import ArgosTranslator
 from lib.classes.tts_manager import TTSManager
@@ -2033,6 +2034,21 @@ def get_sentences(session_id:str, text:str)->list|None:
             lang = session['translate']
         tts_engine = session['tts_engine']
         max_chars = int(language_mapping[lang]['max_chars'] / 2)
+
+        if lang not in ['zho', 'jpn', 'kor', 'tha', 'lao', 'mya', 'khm']:
+            # XTTS keeps a natural intonation on whole sentences up to its per-language
+            # limit, cutting at max_chars/2 forced splits in the middle of most sentences
+            hard_max = int(language_mapping[lang]['max_chars'] * 0.9) if tts_engine == TTS_ENGINES['XTTS'] else max_chars
+            # engines with their own generation length limit (F5-TTS ~12 s per call)
+            hard_max = min(hard_max, default_engine_settings.get(tts_engine, {}).get('max_chars') or hard_max)
+            chunker = NaturalChunker(
+                hard_max=hard_max,
+                clause_words=language_clause_split_words.get(lang, default_clause_split_words),
+                sml_pattern=SML_TAG_PATTERN,
+                pack_sentences=bool(session.get('pack_sentences', True))
+            )
+            chunks = [_strip_leading_noise(c) for c in chunker.chunk(text)]
+            return [c for c in chunks if c and any(ch.isalnum() for ch in c)]
 
         text, sml_blocks = escape_sml(text)
         assert not SML_TAG_PATTERN.search(text)
