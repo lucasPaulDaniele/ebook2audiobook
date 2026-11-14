@@ -2468,7 +2468,10 @@ def foreign2latin(text:str, base_lang:str)->str:
         key:str = f'__TTS_MARKER_{i}__'
         protected[key] = m.group(0)
         text = text.replace(m.group(0), key)
-    tokens:list[str] = re.findall(r"\w+|[^\w\s]", text, re.UNICODE)
+    matches = list(re.finditer(r"\w+|[^\w\s]", text, re.UNICODE))
+    tokens:list[str] = [m.group(0) for m in matches]
+    # whether the source had no whitespace right before each token
+    glued:list[bool] = [i > 0 and m.start() == matches[i - 1].end() for i, m in enumerate(matches)]
     buf:list[str] = []
     for t in tokens:
         if t in protected:
@@ -2479,6 +2482,9 @@ def foreign2latin(text:str, base_lang:str)->str:
             buf.append(t)
     out: str = ''
     joiners = ("'", "\u2018", "\u2019")  # stay glued to the next word (contractions)
+    # a hyphen stays glued to the next word only when it was in the source
+    # ("dit-il", "peut-\u00eatre"), so a spaced dialogue dash keeps its space
+    hyphens = ('-', '\u2010', '\u2011')
     for i, t in enumerate(buf):
         if i == 0:
             out += t
@@ -2492,6 +2498,8 @@ def foreign2latin(text:str, base_lang:str)->str:
                 out += ' ' + t
             elif prev_is_protected or curr_is_protected:
                 out += ' ' + t
+            elif prev in hyphens and glued[i]:
+                out += t
             elif not prev_is_word and not prev_is_protected and curr_is_word and prev not in joiners:
                 out += ' ' + t
             else:
