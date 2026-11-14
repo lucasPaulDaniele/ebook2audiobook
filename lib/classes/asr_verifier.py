@@ -58,6 +58,63 @@ def norm_text(s:str)->str:
     return ' '.join(s.split())
 
 
+# Whisper writes the abbreviations the TTS text spells out ("M. Rollins", "8 a 10 cm", "94 %",
+# "de 7h a 8h30"): counted as errors, they make repairs for nothing and false positives
+WHISPER_ABBREVIATIONS = {
+    'fr': [
+        (r'\bMM\.(?=\s)', 'messieurs'), (r'\bM\.(?=\s)', 'monsieur'), (r'\bMme\b\.?', 'madame'),
+        (r'\bMmes\b\.?', 'mesdames'), (r'\bMlle\b\.?', 'mademoiselle'), (r'\bMlles\b\.?', 'mesdemoiselles'),
+        (r'\bDr\b\.?', 'docteur'), (r'\bPr\b\.?', 'professeur'), (r'\bSte\b\.?', 'sainte'), (r'\bSt\b\.?', 'saint'),
+        (r'(\d)\s?h\s?(\d{2})\b', r'\1 heures \2'), (r'(\d)\s?h\b', r'\1 heures'),
+        (r'(\d)\s?%', r'\1 pour cent'), (r'(\d)\s?km\b', r'\1 kilometres'), (r'(\d)\s?cm\b', r'\1 centimetres'),
+        (r'(\d)\s?mm\b', r'\1 millimetres'), (r'(\d)\s?m\b', r'\1 metres'), (r'(\d)\s?kg\b', r'\1 kilogrammes'),
+        (r'(\d)\s?g\b', r'\1 grammes'), (r'(\d)\s?€', r'\1 euros'), (r'\$\s?(\d+)', r'\1 dollars'),
+    ],
+}
+
+
+def expand_abbreviations(s:str, lang_iso1:str)->str:
+    for pattern, repl in WHISPER_ABBREVIATIONS.get(lang_iso1, []):
+        s = re.sub(pattern, repl, s)
+    return s
+
+
+ISO3 = {'fr': 'fra', 'en': 'eng', 'de': 'deu', 'es': 'spa', 'it': 'ita', 'pt': 'por', 'nl': 'nld'}
+_TTS_PREP = {}
+
+
+def _tts_text_prep(lang_iso1:str):
+    """The steps of the book text preparation that also apply to a transcription (roman
+    numerals, abbreviations and symbols of normalize_text), or None when lib.core cannot be
+    loaded. Imported on first use: lib.core is heavy."""
+    if lang_iso1 not in _TTS_PREP:
+        try:
+            from lib.core import normalize_text, roman2number
+            lang = ISO3.get(lang_iso1, lang_iso1)
+            _TTS_PREP[lang_iso1] = lambda t: normalize_text(roman2number(t), lang, lang_iso1, 'xtts')
+        except Exception:
+            _TTS_PREP[lang_iso1] = None
+    return _TTS_PREP[lang_iso1]
+
+
+def prepare_like_tts(hyp:str, lang_iso1:str)->str:
+    """A transcription written the way the book text was prepared before the reading, so
+    only real reading differences count: Whisper writes "M. Rollins", "8h30", "16e", "2,5 kg",
+    "1 000", "2015" where the TTS text says the words."""
+    t = expand_abbreviations(hyp, lang_iso1)
+    t = re.sub(r'(?<=\d)[\s\u00a0\u202f](?=\d{3}\b)', '', t)
+    if lang_iso1 == 'fr':
+        t = re.sub(r'(\d+),(\d+)', r'\1 virgule \2', t)
+    t = spell_numbers(t, lang_iso1)
+    prep = _tts_text_prep(lang_iso1)
+    if prep:
+        try:
+            t = prep(t)
+        except Exception:
+            pass
+    return t
+
+
 def spell_numbers(s:str, lang_iso1:str)->str:
     # Whisper writes "192e" / "2012" where the TTS text says the words
     from num2words2 import num2words
@@ -92,9 +149,15 @@ def edit_distance(a:str, b:str)->int:
     return prev[-1]
 
 
+def _fold(s:str)->str:
+    return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+
+
 def cer(ref:str, hyp:str, lang_iso1:str='fr')->float:
     r = norm_text(ref).replace('-', ' ')
-    h = norm_text(spell_numbers(hyp, lang_iso1)).replace('-', ' ')
+    h = norm_text(prepare_like_tts(hyp, lang_iso1)).replace('-', ' ')
+    # accents are not what Whisper is judged on ("metres" / "mètres")
+    r, h = _fold(r), _fold(h)
     r, h = ' '.join(r.split()), ' '.join(h.split())
     if not r:
         return 0.0 if not h else 1.0
@@ -202,7 +265,7 @@ def has_extra_tail(ref:str, hyp:str)->bool:
     """The transcription is the text followed by words that are not in it: "Il y a un
     pirate dans la cave d'Helto" for "Il y a un pirate dans la cave"."""
     r = norm_text(ref).split()
-    h = norm_text(hyp).split()
+    h = norm_text(prepare_like_tts(hyp, 'fr') if re.search(r'\d', hyp) else hyp).split()
     if len(h) <= len(r) or not r:
         return False
     # the last words of the text are found before the end of the transcription
