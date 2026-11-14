@@ -56,3 +56,26 @@ def test_any_word_heard_after_the_end_of_the_text_is_a_parasite():
     assert spoken_punctuation('les mains toujours attachées à la chaise.', 'les mains toujours attachées à la chaise peint.') == 1
     assert spoken_punctuation('La Ballade de Simon et Eleanor.', 'La balade de Simon et Eleanor Plain') == 1
     assert spoken_punctuation('Il y a un pirate dans la cave.', 'Il y a un pirate dans la cave.') == 0
+
+
+def test_chunks_of_a_corrected_part_to_check_for_the_new_control(tmp_path):
+    import json
+    from lib.classes.asr_verifier import AsrVerifier
+    v = AsrVerifier({'process_dir': str(tmp_path), 'language_iso1': 'fr'}, str(tmp_path))
+    chunks = [{'j': 0, 'wav': 'a.flac', 'text': CACHOT}, {'j': 1, 'wav': 'b.flac', 'text': CACHOT},
+              {'j': 2, 'wav': 'c.flac', 'text': CACHOT}]
+    with open(v.queue_path, 'w', encoding='utf-8') as f:
+        f.write(json.dumps({'block_id': 'B1', 'ch_num': 4, 'chunks': chunks}) + '\n')
+        f.write(json.dumps({'block_id': 'B2', 'ch_num': 5, 'chunks': [{'j': 0, 'wav': 'd.flac', 'text': CACHOT}]}) + '\n')
+    results = [
+        {'wav': 'a.flac', 'model': 'small', 'cer': 0.1, 'asr': CACHOT_HEARD},
+        # repaired since: the latest turbo transcription no longer hears it
+        {'wav': 'b.flac', 'model': 'small', 'cer': 0.1, 'asr': CACHOT_HEARD},
+        {'wav': 'b.flac', 'model': 'turbo', 'cer': 0.0, 'asr': CACHOT},
+        {'wav': 'c.flac', 'model': 'small', 'cer': 0.0, 'asr': CACHOT},
+        {'wav': 'd.flac', 'model': 'small', 'cer': 0.1, 'asr': CACHOT_HEARD},
+    ]
+    with open(v.results_path, 'w', encoding='utf-8') as f:
+        for r in results:
+            f.write(json.dumps(r, ensure_ascii=False) + '\n')
+    assert v.spoken_punct_chunks({'B1'}) == {(4, 0)}

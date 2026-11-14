@@ -3054,10 +3054,16 @@ def convert_chapters2audio(session_id:str)->bool:
             unload_tts_manager(tts)
         return takes
 
-    def _repair(bad:list[dict], k_part:int, again:set)->tuple[int, set]:
+    def _repair(bad:list[dict], k_part:int, again:set, control:str|None=None)->tuple[int, set]:
         """Repairs the confirmed bad chunks of one part. Returns (repaired count, touched chapters)."""
         attempted = {r.get('wav') for r in asr_verifier.repairs()}
-        if again:
+        if again and control:
+            # a control added after the part was corrected: new seeds, away from the repair
+            # (1..3) and second chance (4..11) ones
+            bad = [b for b in bad if (b['ch_num'], b['j']) in again]
+            ks = range(40, 40 + AsrVerifier.REPAIR_TAKES + 1)
+            print(f'[verif] controle {control} : {len(bad)} troncon(s) a reprendre, {len(ks)} essais chacun', flush=True)
+        elif again:
             bad = [b for b in bad if (b['ch_num'], b['j']) in again]
             ks = range(AsrVerifier.REPAIR_TAKES + 1, AsrVerifier.REPAIR_TAKES + 1 + again_takes)
             print(f'[verif] seconde chance manuelle : {len(bad)} troncon(s), {again_takes} nouveaux essais chacun', flush=True)
@@ -3187,7 +3193,7 @@ def convert_chapters2audio(session_id:str)->bool:
             print(f'[livraison] copie impossible de {path} : {e}')
             return None
 
-    def _correct_part(k_part:int, again:set|None=None)->bool:
+    def _correct_part(k_part:int, again:set|None=None, control:str|None=None)->bool:
         """Correction of one part of the book, as soon as its last chapter is synthesised:
         Whisper check of its chunks, repairs (+ automatic second chance), chapters rebuilt
         with their silences, progressive export, one chaptered m4b of the part delivered."""
@@ -3211,7 +3217,7 @@ def convert_chapters2audio(session_id:str)->bool:
                 b['ch_num'] = by_id[b['block_id']][0]
             n_bad = len(bad)
             print(f'[verif] partie {k_part} : {n_bad} troncon(s) confirme(s) au-dessus de {asr_confirm_cer * 100:.0f} % de CER', flush=True)
-            repaired, touched = _repair(bad, k_part, again)
+            repaired, touched = _repair(bad, k_part, again, control)
         # final cadence of the titles / chapter ends of the part, for the report
         cad_final = []
         for ch in part:
@@ -3245,15 +3251,26 @@ def convert_chapters2audio(session_id:str)->bool:
         not_falling = [c for c in cad_final if not c['falls']]
         if again:
             done = parts_state['done'].setdefault(str(k_part), {'chapters': [part[0], part[-1]], 'bad': 0, 'repaired': 0})
-            done['again_repaired'] = done.get('again_repaired', 0) + repaired
+            if control:
+                done.setdefault('controls', ['cer', 'cadence'])
+                if control not in done['controls']:
+                    done['controls'].append(control)
+                done[f'{control}_repaired'] = done.get(f'{control}_repaired', 0) + repaired
+            else:
+                done['again_repaired'] = done.get('again_repaired', 0) + repaired
             done.update(m4b=delivered or m4b, cadence_targets=len(cad_final),
                         cadence_not_falling=[[c['ch_num'], c['j'], c['kind'], c['text'][:80]] for c in not_falling])
             _parts_state_save()
             _deliver(_write_verification_report())
-            print(f'[verif] seconde chance partie {k_part} : {repaired} troncon(s) repare(s)', flush=True)
+            if control:
+                print(f'[verif] === CONTROLE {control.upper()} PARTIE {k_part}/{len(parts)} : {repaired}/{len(again)} troncon(s) repare(s) -> {delivered or m4b} ===', flush=True)
+                if asr_verifier and k_part < len(parts):
+                    asr_verifier.start_watcher()
+            else:
+                print(f'[verif] seconde chance partie {k_part} : {repaired} troncon(s) repare(s)', flush=True)
             return True
         parts_state['done'][str(k_part)] = {
-            'chapters': [part[0], part[-1]], 'bad': n_bad, 'repaired': repaired, 'm4b': delivered or m4b,
+            'chapters': [part[0], part[-1]], 'bad': n_bad, 'repaired': repaired, 'm4b': delivered or m4b, 'controls': list(asr_controls),
             'cadence_targets': len(cad_final), 'cadence_not_falling': [[c['ch_num'], c['j'], c['kind'], c['text'][:80]] for c in not_falling],
             'minutes': round((time.time() - t0) / 60, 1), 'finished': time.strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -3265,9 +3282,31 @@ def convert_chapters2audio(session_id:str)->bool:
             asr_verifier.start_watcher()
         return True
 
+    def _control_done_part(k_part:int)->None:
+        done = parts_state['done'][str(k_part)]
+        missing = [c for c in asr_controls if c not in done.get('controls', ['cer', 'cadence'])]
+        if not (asr_verifier and 'point' in missing):
+            return
+        part = parts[k_part - 1]
+        targets = asr_verifier.spoken_punct_chunks({kept[ch - 1]['id'] for ch in part})
+        print(f'\n[verif] ===== CONTROLE POINT PARTIE {k_part}/{len(parts)} : chapitres {part[0]} a {part[-1]}, '
+              f'{len(targets)} troncon(s) ou un "point" est entendu =====', flush=True)
+        if targets:
+            _correct_part(k_part, targets, control='point')
+        else:
+            done.setdefault('controls', ['cer', 'cadence']).append('point')
+            _parts_state_save()
+
     def _after_chapter(ch_num:int)->None:
         k_part = part_of_last.get(ch_num)
-        if not k_part or str(k_part) in parts_state['done']:
+        if not k_part:
+            return
+        if str(k_part) in parts_state['done']:
+            try:
+                _control_done_part(k_part)
+            except Exception as e:
+                DependencyError(e)
+                print(f'[verif] controle de la partie {k_part} interrompu par une erreur : {e}')
             return
         # the correction improves the book, it must never cost the hours of synthesis
         try:
@@ -3423,6 +3462,9 @@ def convert_chapters2audio(session_id:str)->bool:
         parts = split_in_parts([_count_sentences(b['sentences']) for b in kept], int(os.environ.get('E2A_REPAIR_PARTS', '3')))
         part_of_last = {p[-1]: k for k, p in enumerate(parts, start=1)}
         asr_confirm_cer = ASR_CONFIRM_CER
+        # controls of a corrected part; a part delivered before one of them existed is checked
+        # for it when the conversion resumes ('point': final full stop read aloud by XTTS)
+        asr_controls = ['cer', 'cadence', 'point']
         cadence_on = os.environ.get('E2A_CADENCE', '1') != '0' and session['tts_engine'] in (TTS_ENGINES['XTTS'], TTS_ENGINES['F5TTS'])
         cadence_log = os.path.join(session['process_dir'], 'cadence.jsonl')
         # E2A_REPAIR_AGAIN=<file of "ch_num j" lines>: manual second chance for chosen chunks,

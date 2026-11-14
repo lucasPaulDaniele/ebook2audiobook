@@ -563,6 +563,20 @@ class AsrVerifier:
             print(f"[verif] essai {i}/{len(takes)} CER {t['cer']:.3f}{note}", flush=True)
         asr.close()
 
+    def spoken_punct_chunks(self, block_ids:set)->set:
+        """(ch_num, j) of the chunks whose latest transcription hears a "point" the text does
+        not have: what a part corrected before this control must be checked for."""
+        results = self._latest_results()
+        out = set()
+        for ch in _read_jsonl(self.queue_path):
+            if ch['block_id'] not in block_ids:
+                continue
+            for c in ch['chunks']:
+                r = results.get(c['wav'])
+                if r and spoken_punctuation(c['text'], r.get('asr') or ''):
+                    out.add((ch['ch_num'], c['j']))
+        return out
+
     def record_result(self, wav:str, score:float, hyp:str)->None:
         _append_jsonl(self.results_path, {'wav': wav, 'model': 'turbo', 'cer': round(score, 4), 'asr': hyp, 'v': SCORE_VERSION})
 
