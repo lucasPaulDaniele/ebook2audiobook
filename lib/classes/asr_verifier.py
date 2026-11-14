@@ -173,7 +173,7 @@ _E_ACCENT = re.compile(r'(?:ées|ée|és|é)$')
 def sound_key(word:str, lang_iso1:str='fr')->str:
     """A word as it sounds, for the silent endings Whisper spells at random: "endroits" /
     "endroit", "aux chats" / "au chat", "ils parlent" / "il parle", "née" / "né", "trompez" /
-    "tromper". A pronounced difference stays: "petite" / "petit", "le" / "les", "parle" /
+    "tromper", "voit" / "voie". A pronounced difference stays: "petite" / "petit", "le" / "les", "parle" /
     "parlé"."""
     if lang_iso1 != 'fr':
         return word
@@ -183,11 +183,14 @@ def sound_key(word:str, lang_iso1:str='fr')->str:
     if len(w) >= 2 and e_end.search(w):
         return _fold(e_end.sub('', w)) + 'É'
     if len(w) <= 3:
-        return re.sub(r'(?<=[aiouy])e$', '', _fold(w))
+        # not after an e: "les" / "le" are said differently
+        return re.sub(r'(?<=[aiouy])[etsx]$', '', _fold(w))
     w = _fold(w)
     if len(w) > 5 and w.endswith('ent'):
         w = w[:-2]
     w = re.sub(r'(?<=.{3})[sx]$', '', w)
+    # silent final consonant after a vowel: "voit" / "voie" / "vois", "lait" / "laid"
+    w = re.sub(r'(?<=[aeiouy])[td]$', '', w)
     w = re.sub(r'(?<=[aeiouy])e$', '', w)
     return w
 

@@ -36,6 +36,9 @@ def test_words_that_sound_the_same_are_not_errors():
         ("Tromper l'œil.", "Trompez l'œil."),
         ("Je suis née ici.", "Je suis né ici."),
         ("La vue est belle.", "La vu est belle."),
+        ("Personne ne voit ça.", "Personne ne voie ça."),
+        ("Ils voient le lait.", "Il voit le laid."),
+        ("Il lit la nuit.", "Il lis la nuits."),
         ("Villes perdues de miel et d'os.", "Ville perdue de miel et d'os."),
     ]
     for text, heard in pairs:
