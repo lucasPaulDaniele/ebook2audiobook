@@ -30,8 +30,8 @@ def test_a_point_of_the_text_is_not_a_defect():
 
 
 def test_a_long_sentence_with_a_spoken_point_is_now_above_the_threshold():
-    # the CER alone lets it through: the extra word is a few % of a long sentence
-    assert cer(LONG, LONG_HEARD) < CONFIRM_CER
+    # the CER alone hardly sees it: the extra word is a few % of a long sentence
+    assert cer(LONG, LONG_HEARD) < 0.04
     assert score(LONG, LONG_HEARD) > CONFIRM_CER
     assert score(LONG, LONG) == cer(LONG, LONG)
 

@@ -33,7 +33,10 @@ WATCH_THREADS = 4
 WATCH_FLAG_CER = 0.15     # Whisper small: flag for a closer look
 # real hallucinations (tail babble, inserted or swapped words) often score 3-6 %: a repair
 # only replaces a chunk when a new take scores better, so a low threshold is safe
-CONFIRM_CER = float(os.environ.get('E2A_ASR_CONFIRM_CER', 0.04))
+# 3 % since the CER compares sounds (see sound_key): a one-syllable error in a long sentence
+# ("se sentent" heard "se sont") no longer reaches 4 % with the plural mistakes it used to
+# come with
+CONFIRM_CER = float(os.environ.get('E2A_ASR_CONFIRM_CER', 0.03))
 REPAIR_TAKES = 3
 # automatic second chance: a chunk whose best repair take is still above this CER gets
 # SECOND_CHANCE_TAKES more takes with new seeds
@@ -45,8 +48,8 @@ SECOND_CHANCE_TAKES = int(os.environ.get('E2A_SECOND_CHANCE_TAKES', 8))
 # not say it wins
 SPOKEN_PUNCT_WORDS = ('point', 'points')
 SPOKEN_PUNCT_PENALTY = float(os.environ.get('E2A_SPOKEN_PUNCT_PENALTY', 0.05))
-# version of the scores written in asr_results.jsonl: 2 = penalty included
-SCORE_VERSION = 2
+# version of the scores written in asr_results.jsonl: 2 = penalty included, 3 = sounds compared
+SCORE_VERSION = 3
 
 
 def same_transcription(hyps:list[str])->bool:
@@ -157,6 +160,38 @@ def edit_distance(a:str, b:str)->int:
     return prev[-1]
 
 
+# French words Whisper spells at random because they sound the same
+HOMOPHONES = {
+    'fr': {'aux': 'au', 'eaux': 'eau', 'ils': 'il', 'elles': 'elle', 'leurs': 'leur', 'sont': 'son', 'ont': 'on',
+           'ces': 'ses', "c'est": "s'est", 'cette': 'cet', 'peut': 'peu', 'peux': 'peu', 'quels': 'quel',
+           'quelle': 'quel', 'quelles': 'quel', 'où': 'ou', 'à': 'a', 'là': 'la'},
+}
+_E_SOUND = re.compile(r'(?:ées|ée|és|é|er|ez)$')
+_E_ACCENT = re.compile(r'(?:ées|ée|és|é)$')
+
+
+def sound_key(word:str, lang_iso1:str='fr')->str:
+    """A word as it sounds, for the silent endings Whisper spells at random: "endroits" /
+    "endroit", "aux chats" / "au chat", "ils parlent" / "il parle", "née" / "né", "trompez" /
+    "tromper". A pronounced difference stays: "petite" / "petit", "le" / "les", "parle" /
+    "parlé"."""
+    if lang_iso1 != 'fr':
+        return word
+    w = HOMOPHONES['fr'].get(word, word)
+    # "-er" / "-ez" only on long words: "mer", "fer" do not end with an /e/
+    e_end = _E_SOUND if len(w) > 4 else _E_ACCENT
+    if len(w) >= 2 and e_end.search(w):
+        return _fold(e_end.sub('', w)) + 'É'
+    if len(w) <= 3:
+        return re.sub(r'(?<=[aiouy])e$', '', _fold(w))
+    w = _fold(w)
+    if len(w) > 5 and w.endswith('ent'):
+        w = w[:-2]
+    w = re.sub(r'(?<=.{3})[sx]$', '', w)
+    w = re.sub(r'(?<=[aeiouy])e$', '', w)
+    return w
+
+
 def _fold(s:str)->str:
     return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
 
@@ -164,7 +199,9 @@ def _fold(s:str)->str:
 def cer(ref:str, hyp:str, lang_iso1:str='fr')->float:
     r = norm_text(ref).replace('-', ' ')
     h = norm_text(prepare_like_tts(hyp, lang_iso1)).replace('-', ' ')
-    # accents are not what Whisper is judged on ("metres" / "mètres")
+    # words compared by their sound, accents are not what Whisper is judged on
+    r = ' '.join(sound_key(w, lang_iso1) for w in r.split())
+    h = ' '.join(sound_key(w, lang_iso1) for w in h.split())
     r, h = _fold(r), _fold(h)
     r, h = ' '.join(r.split()), ' '.join(h.split())
     if not r:

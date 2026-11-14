@@ -113,6 +113,9 @@ def measure(path:str)->dict|None:
 
 
 CER_TIE = 0.005
+# a title / chapter end take Whisper accepts: calibrated at 4 % on the Piranese bench, kept
+# when the repair threshold moves
+ACCEPT_CER = 0.04
 
 
 def choose_take(cands:list[dict], max_cer:float)->dict|None:

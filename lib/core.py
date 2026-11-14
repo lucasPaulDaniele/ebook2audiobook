@@ -3114,7 +3114,7 @@ def convert_chapters2audio(session_id:str)->bool:
             if kind:
                 for t in cands:
                     t['cadence'] = cadence.measure(t['wav'])
-                best = cadence.choose_take(cands, asr_confirm_cer)
+                best = cadence.choose_take(cands, max(asr_confirm_cer, cadence.ACCEPT_CER))
             else:
                 best = min(cands, key=lambda t: t['cer']) if cands else None
             fixed = best is not None and best['cer'] < b['cer']
@@ -3160,7 +3160,7 @@ def convert_chapters2audio(session_id:str)->bool:
         for ch, j, kind, wav, cands in groups:
             for t in cands:
                 t['cadence'] = cadence.measure(t['wav'])
-            best = cadence.choose_take(cands, asr_confirm_cer)
+            best = cadence.choose_take(cands, max(asr_confirm_cer, cadence.ACCEPT_CER))
             if best is None:
                 continue
             shutil.copyfile(best['wav'], wav)
