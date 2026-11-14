@@ -39,6 +39,14 @@ REPAIR_TAKES = 3
 # SECOND_CHANCE_TAKES more takes with new seeds
 SECOND_CHANCE_CER = float(os.environ.get('E2A_SECOND_CHANCE_CER', 0.15))
 SECOND_CHANCE_TAKES = int(os.environ.get('E2A_SECOND_CHANCE_TAKES', 8))
+# XTTS sometimes reads the final full stop aloud ("...être un cachot point."). On a long
+# sentence the extra word weighs less than CONFIRM_CER, so every "point" heard but not
+# written adds a penalty above it: the chunk is flagged, confirmed, and a take that does
+# not say it wins
+SPOKEN_PUNCT_WORDS = ('point', 'points')
+SPOKEN_PUNCT_PENALTY = float(os.environ.get('E2A_SPOKEN_PUNCT_PENALTY', 0.05))
+# version of the scores written in asr_results.jsonl: 2 = penalty included
+SCORE_VERSION = 2
 
 
 def same_transcription(hyps:list[str])->bool:
@@ -261,6 +269,36 @@ TRIM_GAP_DB = -25
 TRIM_MAX_CUTS = 5
 
 
+def spoken_punctuation(ref:str, hyp:str)->int:
+    """Parasite words: punctuation read aloud ("point") heard but not in the text, or words
+    heard after the end of the text. The extra "point" of XTTS is heard "point", "pointe",
+    "peint", "plain", "print"..., always after the last word: a tail counts as one."""
+    r = norm_text(ref).split()
+    h = norm_text(hyp).split()
+    points = sum(max(0, h.count(w) - r.count(w)) for w in SPOKEN_PUNCT_WORDS)
+    return max(points, 1 if has_extra_tail(ref, hyp) else 0)
+
+
+def score(ref:str, hyp:str, lang_iso1:str='fr')->float:
+    """What every decision uses: the CER plus the spoken punctuation penalty."""
+    return cer(ref, hyp, lang_iso1) + SPOKEN_PUNCT_PENALTY * spoken_punctuation(ref, hyp)
+
+
+def stored_score(text:str, r:dict, lang_iso1:str='fr')->float:
+    """Score of a line of asr_results.jsonl. A line written by an older version is scored
+    again from its transcription, so a part already corrected is judged with today's rules
+    (spoken "point", Whisper abbreviations)."""
+    if r.get('v', 1) >= SCORE_VERSION:
+        return r['cer']
+    key = (text, r.get('asr') or '', lang_iso1)
+    if key not in _RESCORED:
+        _RESCORED[key] = score(text, r.get('asr') or '', lang_iso1)
+    return _RESCORED[key]
+
+
+_RESCORED = {}
+
+
 def has_extra_tail(ref:str, hyp:str)->bool:
     """The transcription is the text followed by words that are not in it: "Il y a un
     pirate dans la cave d'Helto" for "Il y a un pirate dans la cave"."""
@@ -320,9 +358,9 @@ def trim_tail(asr:'Whisper', take:dict, lang_iso1:str)->bool:
             audio = np.concatenate([cut, pad])
             sf.write(tmp, audio, sr, subtype=sf.info(take['wav']).subtype)
             hyp = asr.transcribe(tmp)
-            score = round(cer(take['text'], hyp, lang_iso1), 4)
-            if score < best[0] - 0.02:
-                best = (score, audio, hyp)
+            value = round(score(take['text'], hyp, lang_iso1), 4)
+            if value < best[0] - 0.02:
+                best = (value, audio, hyp)
         if os.path.exists(tmp):
             os.remove(tmp)
         if best[1] is None:
@@ -396,10 +434,10 @@ def watch(queue_path:str, results_path:str, stop_path:str, model_dir:str, lang_i
                 hyps = asr.transcribe_packed(group)
                 for c in group:
                     hyp = hyps.get(c['wav'], '')
-                    score = cer(c['text'], hyp, lang_iso1)
-                    _append_jsonl(results_path, {'wav': c['wav'], 'model': 'small', 'cer': round(score, 4), 'asr': hyp})
-                    if score > WATCH_FLAG_CER:
-                        print(f"[verif] suspect (CER {score:.2f}) : {c['text'][:70]} => {hyp[:70]}", flush=True)
+                    value = score(c['text'], hyp, lang_iso1)
+                    _append_jsonl(results_path, {'wav': c['wav'], 'model': 'small', 'cer': round(value, 4), 'asr': hyp, 'v': SCORE_VERSION})
+                    if value > WATCH_FLAG_CER or spoken_punctuation(c['text'], hyp):
+                        print(f"[verif] suspect (CER {value:.2f}) : {c['text'][:70]} => {hyp[:70]}", flush=True)
 
 
 # ---------------------------------------------------------------- orchestration (in the conversion process)
@@ -480,7 +518,7 @@ class AsrVerifier:
                 hyps = asr.transcribe_packed(group)
                 for c in group:
                     hyp = hyps.get(c['wav'], '')
-                    _append_jsonl(self.results_path, {'wav': c['wav'], 'model': 'turbo-packed', 'cer': round(cer(c['text'], hyp, self.lang), 4), 'asr': hyp})
+                    _append_jsonl(self.results_path, {'wav': c['wav'], 'model': 'turbo-packed', 'cer': round(score(c['text'], hyp, self.lang), 4), 'asr': hyp, 'v': SCORE_VERSION})
                 done = min(i + 8, len(unseen))
                 eta = (time.time() - t0) / done * (len(unseen) - done)
                 print(f'[verif] passage rapide {done}/{len(unseen)} reste ~{eta / 60:.1f} min', flush=True)
@@ -488,23 +526,24 @@ class AsrVerifier:
                     progress(done / len(unseen) / 2)
         # precise pass: every suspect is transcribed alone by turbo
         results = self._latest_results()
-        suspects = [c for w, c in chunks.items() if w in results and results[w]['model'] != 'turbo' and results[w]['cer'] > CONFIRM_CER]
+        suspects = [c for w, c in chunks.items() if w in results and results[w]['model'] != 'turbo' and stored_score(c['text'], results[w], self.lang) > CONFIRM_CER]
         print(f'[verif] {len(suspects)} troncon(s) suspect(s) a confirmer')
         if suspects:
             asr = asr or Whisper(self.turbo, 'cuda', self.lang)
             for i, c in enumerate(suspects, 1):
                 hyp = asr.transcribe(c['wav'])
-                score = cer(c['text'], hyp, self.lang)
-                _append_jsonl(self.results_path, {'wav': c['wav'], 'model': 'turbo', 'cer': round(score, 4), 'asr': hyp})
-                print(f'[verif] confirmation {i}/{len(suspects)} CER {score:.3f}' + ('  <-- a reparer' if score > CONFIRM_CER else '  (faux positif)'), flush=True)
+                value = score(c['text'], hyp, self.lang)
+                _append_jsonl(self.results_path, {'wav': c['wav'], 'model': 'turbo', 'cer': round(value, 4), 'asr': hyp, 'v': SCORE_VERSION})
+                print(f'[verif] confirmation {i}/{len(suspects)} CER {value:.3f}' + ('  <-- a reparer' if value > CONFIRM_CER else '  (faux positif)')
+                      + ('  [point prononce]' if spoken_punctuation(c['text'], hyp) else ''), flush=True)
         if asr:
             asr.close()
         results = self._latest_results()
         bad = []
         for w, c in chunks.items():
             r = results.get(w)
-            if r and r['model'] == 'turbo' and r['cer'] > CONFIRM_CER:
-                bad.append(dict(c, cer=r['cer'], asr=r['asr']))
+            if r and r['model'] == 'turbo' and stored_score(c['text'], r, self.lang) > CONFIRM_CER:
+                bad.append(dict(c, cer=stored_score(c['text'], r, self.lang), asr=r['asr']))
         return bad
 
     def score_takes(self, takes:list[dict], trim:bool=True)->None:
@@ -515,7 +554,7 @@ class AsrVerifier:
         asr = Whisper(self.turbo, 'cuda', self.lang)
         for i, t in enumerate(takes, 1):
             t['asr'] = asr.transcribe(t['wav'])
-            t['cer'] = round(cer(t['text'], t['asr'], self.lang), 4)
+            t['cer'] = round(score(t['text'], t['asr'], self.lang), 4)
             note = ''
             if trim and t['cer'] > CONFIRM_CER and has_extra_tail(t['text'], t['asr']):
                 before = t['cer']
@@ -525,7 +564,7 @@ class AsrVerifier:
         asr.close()
 
     def record_result(self, wav:str, score:float, hyp:str)->None:
-        _append_jsonl(self.results_path, {'wav': wav, 'model': 'turbo', 'cer': round(score, 4), 'asr': hyp})
+        _append_jsonl(self.results_path, {'wav': wav, 'model': 'turbo', 'cer': round(score, 4), 'asr': hyp, 'v': SCORE_VERSION})
 
     def record_repair(self, item:dict)->None:
         _append_jsonl(self.repairs_path, item)
