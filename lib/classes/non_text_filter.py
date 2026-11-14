@@ -104,7 +104,7 @@ class NonTextFilter:
     def __init__(
         self,
         alpha_ratio:float = 0.75,
-        min_words:int = 2,
+        min_words:int = 1,
         aggressive:bool = True,
         sml_pattern:Optional[re.Pattern] = None,
         lang:Optional[str] = None,
@@ -112,7 +112,8 @@ class NonTextFilter:
         '''
         alpha_ratio : min text-like density per sentence (0..1)
         min_words   : drop sentences with fewer alnum words (or chars*2 in
-                      no-space scripts) than this
+                      no-space scripts) than this. Keep it at 1: one-word
+                      sentences ("Non !", "Merci.", "répondit-il.") are prose.
         aggressive  : also strip bare equations like 'x = y + 3'
         sml_pattern : compiled re.Pattern matching SML tags to preserve
         lang        : ISO-639-3 code, used only for no-space-script handling.

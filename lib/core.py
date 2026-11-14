@@ -44,6 +44,13 @@ from lib.classes.subprocess_pipe import SubprocessPipe
 from lib.classes.vram_detector import VRAMDetector
 from lib.classes.voice_extractor import VoiceExtractor
 from lib.classes.non_text_filter import NonTextFilter
+from lib.classes.epub_sections import split_spine, is_excluded as is_excluded_doc
+from lib.classes.html_tts_prep import prepare_html_for_tts, speak_inline_ordinals
+from lib.classes.natural_chunker import NaturalChunker
+from lib.classes.progressive_export import ProgressiveExporter
+from lib.classes.asr_verifier import AsrVerifier, CONFIRM_CER as ASR_CONFIRM_CER, same_transcription
+from lib.classes.asr_verifier import _append_jsonl as asr_jsonl_append
+from lib.classes import cadence
 #from lib.classes.redirect_console import RedirectConsole
 from lib.classes.argos_translator import ArgosTranslator
 from lib.classes.tts_manager import TTSManager
@@ -1309,6 +1316,61 @@ def get_cover(epubBook:EpubBook, session_id:str)->bool|str:
         DependencyError(e)
         return False
 
+class SpinePiece:
+    """Chapter cut out of a spine document, quacks like the EpubHtml used by filter_blocks()."""
+
+    def __init__(self, doc:EpubHtml, html:str):
+        self.doc = doc
+        self.id = doc.id
+        self.html = html
+
+    def get_body_content(self)->bytes:
+        return self.html.encode('utf-8')
+
+    def get_name(self)->str:
+        return self.doc.get_name()
+
+def is_scanned_book(all_docs:list[Any])->bool:
+    # OCR is for scanned books. In a text book the image-only pages are the cover, the title
+    # page or illustrations: reading their OCR aloud gives garbage ("péi À Q ami").
+    with_text = image_only = 0
+    for doc in all_docs:
+        try:
+            soup = BeautifulSoup(doc.get_body_content(), 'html.parser')
+        except Exception:
+            continue
+        if soup.get_text(strip=True):
+            with_text += 1
+        elif soup.find(['img', 'image']):
+            image_only += 1
+    scanned = image_only > with_text
+    if image_only and not scanned:
+        print(f'{image_only} image-only page(s) (cover, title page…) skipped, no OCR for a text book')
+    return scanned
+
+def split_spine_docs(all_docs:list[Any])->list[Any]:
+    # one block per chapter: split documents bundling several chapters and glue
+    # title-only pages (part titles, calibre heading page breaks) to their chapter
+    try:
+        by_id = {doc.id: doc for doc in all_docs}
+        originals = {doc.id: doc.get_content() for doc in all_docs}
+        pieces = split_spine([(doc.id, originals[doc.id]) for doc in all_docs])
+        result = []
+        for name, html, _title in pieces:
+            doc_id = name.split('#', 1)[0]
+            original = originals[doc_id]
+            original = original.decode('utf-8', errors='ignore') if isinstance(original, bytes) else original
+            if '#' not in name and html == original:
+                result.append(by_id[doc_id])
+            else:
+                result.append(SpinePiece(by_id[doc_id], html))
+        if len(result) != len(all_docs):
+            print(f'Chapters detection: {len(all_docs)} spine documents -> {len(result)} chapters')
+        return result
+    except Exception as e:
+        print(f'split_spine_docs() error: {e}, keeping the original spine')
+        return all_docs
+
 def get_blocks(session_id:str, epubBook:EpubBook)->list:
     try:
         msg = r'''
@@ -1349,6 +1411,8 @@ INTO A NEW TRAINING MODEL. YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
                 print(error)
                 return []
             title = get_ebook_title(epubBook, all_docs)
+            all_docs = split_spine_docs(all_docs)
+            allow_ocr = is_scanned_book(all_docs)
             blocks = []
             stanza_nlp = False
             if session['language'] in year_to_decades_languages:
@@ -1395,7 +1459,7 @@ INTO A NEW TRAINING MODEL. YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
                     zip_names = set(zf.namelist())
                     zip_basenames = {os.path.basename(n): n for n in zip_names}
                     for doc_idx, doc in enumerate(all_docs):
-                        text = filter_blocks(session_id, doc_idx, doc, stanza_nlp, is_num2words_compat, non_text_filter, zf, zip_names, zip_basenames)
+                        text = filter_blocks(session_id, doc_idx, doc, stanza_nlp, is_num2words_compat, non_text_filter, zf, zip_names, zip_basenames, allow_ocr)
                         if text is None:
                             error = f'Error extracting content from document #{doc_idx + 1}; aborting conversion to avoid partial output.'
                             show_alert(session_id, {"type": "warning", "msg": error})
@@ -1427,7 +1491,7 @@ INTO A NEW TRAINING MODEL. YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
         DependencyError(error)
         return []
 
-def filter_blocks(session_id:str, idx:int, doc:EpubHtml, stanza_nlp:Pipeline, is_num2words_compat:bool, non_text_filter:NonTextFilter, zf:zipfile.ZipFile=None, zip_names:set=None, zip_basenames:dict=None)->str|None:
+def filter_blocks(session_id:str, idx:int, doc:EpubHtml, stanza_nlp:Pipeline, is_num2words_compat:bool, non_text_filter:NonTextFilter, zf:zipfile.ZipFile=None, zip_names:set=None, zip_basenames:dict=None, allow_ocr:bool=True)->str|None:
 
     def _tuple_row(node:Any, last_text_char:str|None=None, in_heading:bool=False)->Generator[tuple[str, Any], None, None]|None:
         try:
@@ -1525,27 +1589,20 @@ def filter_blocks(session_id:str, idx:int, doc:EpubHtml, stanza_nlp:Pipeline, is
                 msg = 'No body found. Skip to next doc…'
                 print(msg)
                 return ''
-            # Skip known non-chapter types
-            epub_type = body.get('epub:type', '').lower()
-            if not epub_type:
-                section_tag = soup.find('section')
-                if section_tag:
-                    epub_type = section_tag.get('epub:type', '').lower()
-            excluded = {
-                'frontmatter', 'backmatter', 'toc', 'titlepage', 'colophon',
-                'acknowledgments', 'dedication', 'glossary', 'index',
-                'appendix', 'bibliography', 'copyright-page', 'landmark'
-            }
-            if any(part in epub_type for part in excluded):
+            # Skip known non-chapter types (front/back matter, navigation, epigraphs)
+            if is_excluded_doc(soup):
                 msg = 'No body part. Skip to next doc…'
                 print(msg)
                 return ''
             # remove scripts/styles
             for tag in soup(['script', 'style']):
                 tag.decompose()
+            # notes, page markers, inline formatting, superscripts, all-caps blocks, bullets
+            # and missing final punctuation are fixed on the markup, before flattening
+            prepare_html_for_tts(soup, lang)
             if not body.get_text(strip=True):
                 images = body.find_all('img') + body.find_all('image')
-                if images and zf:
+                if images and zf and allow_ocr:
                     msg = f'Doc {idx}: no text but {len(images)} image(s) detected. Running OCR…'
                     show_alert(session_id, {"type": "info", "msg": msg})
                     ocr_parts = []
@@ -1594,7 +1651,8 @@ def filter_blocks(session_id:str, idx:int, doc:EpubHtml, stanza_nlp:Pipeline, is
                     if prev_typ != typ:
                         token = sml_token(typ)
                         if text_list and text_list[-1] not in {v['static'] for v in TTS_SML.values() if 'static' in v}:
-                            sep = '; ' if prev_typ == 'heading' else ''
+                            # a heading closes its intonation like a sentence before the pause
+                            sep = '. ' if prev_typ == 'heading' and text_list[-1].rstrip()[-1:] not in punctuation_list_set else ''
                             text_list[-1] = text_list[-1] + sep + token
                         else:
                             text_list.append(token)
@@ -1860,37 +1918,108 @@ def get_sentences(session_id:str, text:str)->list|None:
 
     def _force_split_segment(segment:str)->list[str]:
         results = []
-        rest = segment
+        rest = segment.strip()
         hard_set = tuple(punctuation_split_hard_set)
         soft_set = tuple(punctuation_split_soft_set)
+
+        if not rest:
+            return []
+
+        clause_words = language_clause_split_words.get(lang, default_clause_split_words)
+        clause_pattern = re.compile(
+            r'(?i)\b(?:' + '|'.join(map(re.escape, clause_words)) + r')\b'
+        )
+
+        # If there is no punctuation at all, prefer a natural clause boundary instead of
+        # slicing in the middle of the phrase. This keeps long unpunctuated clauses readable.
+        if not any(ch in hard_set or ch in soft_set for ch in rest):
+            clause_positions = [m.end() for m in clause_pattern.finditer(rest) if m.end() > 0.35 * len(rest)]
+            if clause_positions:
+                best_idx = max(clause_positions)
+                left = rest[:best_idx].strip()
+                right = rest[best_idx:].strip()
+                if left and right:
+                    results.extend(_force_split_segment(left))
+                    results.extend(_force_split_segment(right))
+                    return results
+            return [rest]
+
         while rest:
             if _clean_len(rest) <= max_chars:
+                sentence_end = -1
+                for i, char in enumerate(rest[:-1]):
+                    if char not in hard_set:
+                        continue
+                    j = i + 1
+                    while j < len(rest) and rest[j].isspace():
+                        j += 1
+                    if j < len(rest) and (rest[j].isupper() or rest[j].isdigit()):
+                        sentence_end = i + 1
+                        break
+                if sentence_end > 0:
+                    results.append(rest[:sentence_end].strip())
+                    rest = rest[sentence_end:].strip()
+                    continue
                 results.append(rest.strip())
                 break
-            cut = rest[:max_chars + 1]
+
+            target = min(len(rest), max_chars)
             best_idx = -1
-            # 1) regress to the last hard punctuation in the window
-            for i in range(len(cut) - 1, -1, -1):
-                if cut[i] in hard_set:
+
+            # 1) prefer a real sentence-ending punctuation before the target length
+            for i in range(min(target, len(rest) - 1), -1, -1):
+                if rest[i] in hard_set:
                     best_idx = i + 1
                     break
-            # 2) no hard punct -> regress to the last soft punctuation
+
+            # 2) if no hard end was found nearby, allow a hard sentence end a little beyond the
+            # target when it truly closes the sentence (next token starts a new sentence)
             if best_idx == -1:
-                for i in range(len(cut) - 1, -1, -1):
-                    if cut[i] in soft_set:
-                        best_idx = i + 1
-                        break
-            # 3) no punctuation at all -> fall back to last space
+                scan_end = min(len(rest) - 1, target + max_chars * 2)
+                for i in range(target, scan_end + 1):
+                    if rest[i] in hard_set:
+                        j = i + 1
+                        while j < len(rest) and rest[j].isspace():
+                            j += 1
+                        next_text = rest[j:j + 20]
+                        if next_text and (next_text[0].isupper() or next_text[0].isdigit()):
+                            best_idx = i + 1
+                            break
+
+            # 3) soft punctuation is the preferred natural split before clause connectors.
+            # In practice, users prefer a later comma/semicolon over an earlier conjunction
+            # when the sentence is long, because it preserves the narration rhythm. Never
+            # search beyond the next hard sentence boundary.
             if best_idx == -1:
-                idx = cut.rfind(' ')
+                next_hard_end = next(
+                    (i for i in range(target, len(rest)) if rest[i] in hard_set),
+                    len(rest)
+                )
+                for i in range(next_hard_end - 1, -1, -1):
+                    if rest[i] in soft_set:
+                        if i >= max_chars * 0.35 or i >= target:
+                            best_idx = i + 1
+                            break
+
+            # 4) if there is still no safe break, prefer a clause connector before the target
+            if best_idx == -1:
+                clause_positions = [m.end() for m in clause_pattern.finditer(rest[:target]) if m.end() > 0.35 * target]
+                if clause_positions:
+                    best_idx = max(clause_positions)
+
+            # 5) final fallback: whitespace near the max length
+            if best_idx == -1:
+                idx = rest.rfind(' ', 0, target)
                 if idx > 0:
-                    best_idx = idx
-            # 4) last resort -> hard cut at max_chars
-            if best_idx <= 0:
-                best_idx = max_chars
+                    best_idx = idx + 1
+
+            if best_idx <= 0 or best_idx >= len(rest):
+                best_idx = max(1, min(len(rest) - 1, target))
+
             # Safety: never cut inside an SML group
             while best_idx < len(rest) and ord(rest[best_idx]) >= sml_escape_tag:
                 best_idx += 1
+
             left = rest[:best_idx].strip()
             right = rest[best_idx:].strip()
             if not left or right == rest:
@@ -1909,6 +2038,21 @@ def get_sentences(session_id:str, text:str)->list|None:
             lang = session['translate']
         tts_engine = session['tts_engine']
         max_chars = int(language_mapping[lang]['max_chars'] / 2)
+
+        if lang not in ['zho', 'jpn', 'kor', 'tha', 'lao', 'mya', 'khm']:
+            # XTTS keeps a natural intonation on whole sentences up to its per-language
+            # limit, cutting at max_chars/2 forced splits in the middle of most sentences
+            hard_max = int(language_mapping[lang]['max_chars'] * 0.9) if tts_engine == TTS_ENGINES['XTTS'] else max_chars
+            # engines with their own generation length limit (F5-TTS ~12 s per call)
+            hard_max = min(hard_max, default_engine_settings.get(tts_engine, {}).get('max_chars') or hard_max)
+            chunker = NaturalChunker(
+                hard_max=hard_max,
+                clause_words=language_clause_split_words.get(lang, default_clause_split_words),
+                sml_pattern=SML_TAG_PATTERN,
+                pack_sentences=bool(session.get('pack_sentences', True))
+            )
+            chunks = [_strip_leading_noise(c) for c in chunker.chunk(text)]
+            return [c for c in chunks if c and any(ch.isalnum() for ch in c)]
 
         text, sml_blocks = escape_sml(text)
         assert not SML_TAG_PATTERN.search(text)
@@ -2016,48 +2160,21 @@ def get_sentences(session_id:str, text:str)->list|None:
             if combined:
                 if _strip_escaped_sml(combined).strip():
                     if _clean_len(combined) <= max_chars:
-                        final_list.append(combined)
+                        final_list.extend(_force_split_segment(combined))
                     else:
                         final_list.extend(_force_split_segment(combined))
                 elif final_list:
                     # Trailing pure-SML — attach to last sentence, no standalone
                     final_list[-1] = final_list[-1].rstrip() + ' ' + combined
 
-        final_list = [_strip_leading_noise(s) for s in final_list if s.strip()]
+        normalized_list = []
+        for item in final_list:
+            if _clean_len(item) <= max_chars:
+                normalized_list.extend(_force_split_segment(item))
+            else:
+                normalized_list.append(item)
+        final_list = [_strip_leading_noise(s) for s in normalized_list if s.strip()]
         final_list = [s for s in final_list if s]
-
-        # Merge orphan-short sentences. A sentence below max_chars/2 is "too short";
-        # absorb it into the previous (preferred) or next sentence when that fits.
-        merge_threshold = max_chars // 2
-        merge_ceiling   = max_chars + max_chars // 2   # max_chars + overhead of max_chars/2
-
-        merged_list = []
-        i = 0
-        n = len(final_list)
-        while i < n:
-            cur = final_list[i].strip()
-            if not cur:
-                i += 1
-                continue
-            cur_len = _clean_len(cur)
-            if cur_len <= merge_threshold:
-                # 1) try to attach to the previous sentence
-                if merged_list:
-                    prev = merged_list[-1]
-                    if _clean_len(prev) + 1 + cur_len <= merge_ceiling:
-                        merged_list[-1] = prev.rstrip() + ' ' + cur.lstrip()
-                        i += 1
-                        continue
-                # 2) otherwise try to glue it onto the next sentence
-                if i + 1 < n:
-                    nxt = final_list[i + 1].strip()
-                    if cur_len + 1 + _clean_len(nxt) <= merge_ceiling:
-                        merged_list.append(cur.rstrip() + ' ' + nxt.lstrip())
-                        i += 2
-                        continue
-            merged_list.append(cur)
-            i += 1
-        final_list = merged_list
 
         if lang in ['zho', 'jpn', 'kor', 'tha', 'lao', 'mya', 'khm']:
             result = []
@@ -2137,12 +2254,15 @@ def set_formatted_number(text:str, lang:str, lang_iso1:str, is_num2words_compat:
     # handle optional range with dash/en dash/em dash between numbers, and allow trailing punctuation
     number_re = re.compile(
         r'(?<!\w)'
-        r'(\d{1,18}(?:,\s*\d{1,18})*(?:\.\d{1,12})?)'      # first number
+        r'(\d{1,18}(?:,\d{3})*(?:\.\d{1,12})?)'            # first number
         r'(?:\s*([-–—])\s*'                                # dash type
-        r'(\d{1,18}(?:,\s*\d{1,18})*(?:\.\d{1,12})?))?'    # optional second number
+        r'(\d{1,18}(?:,\d{3})*(?:\.\d{1,12})?))?'          # optional second number
         r'([^\w\s]*)',                                     # optional trailing punctuation
         re.UNICODE
     )
+    if lang in decimal_comma_languages:
+        # "1,83 mètre": the comma is the decimal separator, "1,830" is not a thousand
+        text = re.sub(r'(?<![\d,.])(\d{1,15}),(\d{1,12})(?![\d,])', r'\1.\2', text)
 
     def _normalize_commas(num_str:str)->str:
         # ormalize number string to standard comma format: 1,234,567
@@ -2173,6 +2293,15 @@ def set_formatted_number(text:str, lang:str, lang_iso1:str, is_num2words_compat:
 
         if is_num2words_compat:
             new_lang_iso1 = lang_iso1.replace('zh', 'zh_CN')
+            if isinstance(num, float) and lang in decimal_comma_languages and '.' in clean:
+                # "1,83" is read "un virgule quatre-vingt-trois", not digit by digit
+                int_part, dec_part = clean.lstrip('+-').split('.', 1)
+                comma_word = language_math_phonemes.get(lang, {}).get(',', ',')
+                zeros = len(dec_part) - len(dec_part.lstrip('0'))
+                zero_word = num2words(0, lang=new_lang_iso1)
+                dec_words = ' '.join([zero_word] * zeros + ([num2words(int(dec_part), lang=new_lang_iso1)] if dec_part.strip('0') else []))
+                sign = num2words(-1, lang=new_lang_iso1).split()[0] + ' ' if clean.startswith('-') else ''
+                return f'{sign}{num2words(int(int_part or 0), lang=new_lang_iso1)} {comma_word} {dec_words}'.strip()
             return num2words(num, lang=new_lang_iso1)
         else:
             phoneme_map = language_math_phonemes.get(
@@ -2187,6 +2316,9 @@ def set_formatted_number(text:str, lang:str, lang_iso1:str, is_num2words_compat:
         second_num = _clean_single_num(match.group(3)) if match.group(3) else ''
         trailing = match.group(4) or ''
         if second_num:
+            range_word = number_range_words.get(lang)
+            if range_word:
+                return f'{first_num} {range_word} {second_num}{trailing}'
             return f'{first_num}{dash_char}{second_num}{trailing}'
         else:
             return f'{first_num}{trailing}'
@@ -2295,6 +2427,9 @@ def math2words(text:str, lang:str, lang_iso1:str, tts_engine:str, is_num2words_c
 
     def _repl_ambiguous(match:re.Match)->str:
         # handles "num SYMBOL num" and "SYMBOL num"
+        if match.group(2) == '-' and range_word and not re.search(r'\s', match.group(0)):
+            # a dash glued between two numbers is a range: pages 19-32, 2011-2012
+            return f'{match.group(1)} {range_word} {match.group(3)}'
         if match.group(2) and match.group(2) in ambiguous_replacements:
             return f'{match.group(1)} {ambiguous_replacements[match.group(2)]} {match.group(3)}'
         if match.group(3) and match.group(3) in ambiguous_replacements:
@@ -2311,9 +2446,11 @@ def math2words(text:str, lang:str, lang_iso1:str, tts_engine:str, is_num2words_c
         # If num2words isn't available/compatible, keep original token as-is.
         return m.group(0)
 
+    range_word = number_range_words.get(lang)
     # Matches any digits + optional space/NBSP + st/nd/rd/th, not glued into words.
     re_ordinal = re.compile(r'(?<!\w)(\d+)(?:\s|\u00A0)*(?:st|nd|rd|th)(?!\w)')
-    text = re.sub(r'(\d)\)', r'\1 : ', text)
+    # list numbering "1) item" only at the start of an item, not "(numéro 10) a commencé"
+    text = re.sub(r'(?m)(^|[.:;]\s+)(\d{1,3})\)\s', r'\1\2 : ', text)
     text = re_ordinal.sub(_ordinal_to_words, text)
     # Symbol phonemes
     ambiguous_symbols = {"-", "/", "*", "x"}
@@ -2391,8 +2528,11 @@ def roman2number(text:str)->str:
         key=len,
         reverse=True
     )
+    # the chapter word is case-insensitive, the numeral is not: "partie d'une" must not
+    # become "partie cinq cents'une"; a lowercase numeral ("interlude ii") is only read as
+    # one with the small letters i, v, x and right before a punctuation or the end
     chapter_words_re = re.compile(
-        rf'\b({"|".join(map(re.escape, chapter_words))})\s+([IVXLCDM]+)\b',
+        rf'\b({"|".join(map(re.escape, chapter_words))})\s+((?-i:[IVXLCDM]+|[ivx]+(?=[\s.,;:!?…\[]|$)))(?![\p{{L}}\p{{N}}\'’])',
         re.IGNORECASE | re.UNICODE
     )
     text = re.sub(
@@ -2468,7 +2608,10 @@ def foreign2latin(text:str, base_lang:str)->str:
         key:str = f'__TTS_MARKER_{i}__'
         protected[key] = m.group(0)
         text = text.replace(m.group(0), key)
-    tokens:list[str] = re.findall(r"\w+|[^\w\s]", text, re.UNICODE)
+    matches = list(re.finditer(r"\w+|[^\w\s]", text, re.UNICODE))
+    tokens:list[str] = [m.group(0) for m in matches]
+    # whether the source had no whitespace right before each token
+    glued:list[bool] = [i > 0 and m.start() == matches[i - 1].end() for i, m in enumerate(matches)]
     buf:list[str] = []
     for t in tokens:
         if t in protected:
@@ -2479,6 +2622,9 @@ def foreign2latin(text:str, base_lang:str)->str:
             buf.append(t)
     out: str = ''
     joiners = ("'", "\u2018", "\u2019")  # stay glued to the next word (contractions)
+    # a hyphen stays glued to the next word only when it was in the source
+    # ("dit-il", "peut-\u00eatre"), so a spaced dialogue dash keeps its space
+    hyphens = ('-', '\u2010', '\u2011')
     for i, t in enumerate(buf):
         if i == 0:
             out += t
@@ -2492,6 +2638,8 @@ def foreign2latin(text:str, base_lang:str)->str:
                 out += ' ' + t
             elif prev_is_protected or curr_is_protected:
                 out += ' ' + t
+            elif prev in hyphens and glued[i]:
+                out += t
             elif not prev_is_word and not prev_is_protected and curr_is_word and prev not in joiners:
                 out += ' ' + t
             else:
@@ -2568,8 +2716,19 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
         token = match.group(1)
         for k, expansion in mapping.items():
             if token.lower() == k.lower():
+                # "etc." closing a sentence: the period also ends the sentence, keep it
+                if k.endswith('.') and re.match(r'\s*(?:$|[\p{Lu}«"“\[])', match.string[match.end():]):
+                    return expansion + '.'
                 return expansion
         return token  # fallback
+
+    def _reduce_hard(match:re.Match)->str:
+        # keep the most expressive mark of a run: "?." must stay a question
+        run = match.group(0)
+        for mark in ('?', '!', '…'):
+            if mark in run:
+                return mark + ' '
+        return match.group(2) + ' '
             
     # Remove emojis
     emoji_pattern = re.compile(f"[{''.join(emojis_list)}]+", flags=re.UNICODE)
@@ -2584,6 +2743,7 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
             flags=re.IGNORECASE
         )
         text = pattern.sub(_replace, text)
+    text = re.sub(r'\bO\.\s?K\.', 'Okay', text)
     # This regex matches sequences like a., c.i.a., f.d.a., m.c., etc…
     pattern = re.compile(r'\b(?:[a-zA-Z]\.){1,}[a-zA-Z]?\b\.?')
     # uppercase acronyms
@@ -2596,16 +2756,22 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     text = re.sub(pattern, f" {sml_token('pause')} ", text)
     # Replace single newlines ("\n" or "\r") with spaces
     text = re.sub(r'\r\n|\r|\n', ' ', text)
+    # the '...' key of punctuation_switch cannot match inside a character class
+    text = re.sub(r'\.{3,}', '…', text)
     # Replace punctuations causing hallucinations
     pattern = f"[{''.join(map(re.escape, punctuation_switch.keys()))}]"
     text = re.sub(pattern, lambda match: punctuation_switch.get(match.group(), match.group()), text)
+    # a soft punctuation right after a sentence end is an artefact of the switches above
+    # ("(…celle-ci.) Cela" -> "celle-ci., Cela"), it would add a pause without meaning
+    text = re.sub(r'([.!?…])(?:\s*[,;:])+', r'\1', text)
+    # and a soft one right before it: ", ." left by an incise closing the sentence
+    text = re.sub(r'(?:[,;:]\s*)+([.!?…])', r'\1', text)
     # remove unwanted chars
     chars_remove_table = str.maketrans({ch: ' ' for ch in chars_remove})
     text = text.translate(chars_remove_table)
-    # replace double quotes by a comma if no punctuation precedes it
-    text = re.sub(r'\s*"\s*', '"', text)
-    text = re.sub(r'(?<=[\p{L}\p{N}])"(?=[\p{L}\p{N}]|$)', ', ', text)
-    text = re.sub(r'"', '', text)
+    # quotes are typography: a quoted word must not get pauses around it
+    # ("le mot «minotaure»" read "le mot, minotaure,")
+    text = re.sub(r'"', ' ', text)
     # Replace multiple and spaces with single space
     text = re.sub(r'\s+', ' ', text)
     # Replace ok by 'Owkey'
@@ -2613,11 +2779,13 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     # Escape special characters in the punctuation list for regex
     pattern = '|'.join(map(re.escape, punctuation_split_hard_set))
     # Reduce multiple consecutive punctuations hard
-    text = re.sub(rf'(\s*({pattern})\s*)+', r'\2 ', text).strip()
+    text = re.sub(rf'(\s*({pattern})\s*)+', _reduce_hard, text).strip()
     # Escape special characters in the punctuation list for regex
     pattern = '|'.join(map(re.escape, punctuation_split_soft_set))
     # Reduce multiple consecutive punctuations soft
     text = re.sub(rf'(\s*({pattern})\s*)+', r'\2 ', text).strip()
+    # ordinals written inline ("1er", "2e", "21st") before digits and letters get split
+    text = speak_inline_ordinals(text, lang)
     # Pattern 1: Add a space between UTF-8 characters and numbers
     text = re.sub(r'(?<=[\p{L}])(?=\d)|(?<=\d)(?=[\p{L}])', ' ', text)
     # Replace special chars with words
@@ -2631,7 +2799,9 @@ def block_hash(block: dict) -> str:
     return hashlib.sha1(
         '|'.join((
             (block.get('text') or '').strip(),
-            block.get('voice') or '',
+            # the voice is identified by its file name: the session works on a copy of the
+            # voice, a different folder for the same voice must not reconvert the chapter
+            os.path.basename(block.get('voice') or ''),
             block.get('tts_engine') or TTS_ENGINES['XTTS'],
             block.get('fine_tuned') or 'internal',
             json.dumps(block.get('sentences') or [], ensure_ascii=False),
@@ -2804,10 +2974,369 @@ def convert_chapters2audio(session_id:str)->bool:
     def _count_sentences(sentences:list)->int:
         return sum(1 for s in sentences if any(c.isalnum() for c in s.strip()))
 
+    def _asr_chunks(block_id:str, sentences:list)->list[dict]:
+        block_dir = os.path.join(session['sentences_dir'], block_id)
+        return [
+            {'j': j, 'wav': os.path.join(block_dir, f'{j}.{default_audio_proc_format}'), 'text': ' '.join(SML_TAG_PATTERN.sub(' ', s).split())}
+            for j, s in enumerate(sentences) if any(c.isalnum() for c in s)
+        ]
+
+    def _valid_take(path:str)->bool:
+        try:
+            import soundfile as sf
+            return sf.info(path).frames > 0
+        except Exception:
+            return False
+
+    def _variant(wav:str, tag:str)->str:
+        # "<j>.flac" -> "<j>.<tag>.flac": takes live next to the chunk, ignored by the concat
+        return wav[:-len(default_audio_proc_format) - 1] + f'.{tag}.{default_audio_proc_format}'
+
+    def _cadence_retakes(ch_num:int, j:int, kind:str, wav:str, sentence:str, block_voice:str|None)->None:
+        # titles and chapter ends must close on a falling tune: when the take does not fall,
+        # up to cadence.MAX_TAKES more takes are drawn and the most falling one is kept.
+        # Every take stays on disk (".cadK") until the part correction, where Whisper may
+        # need them (a title must also be read right)
+        c = cadence.measure(wav)
+        entry = {'wav': wav, 'ch_num': ch_num, 'j': j, 'kind': kind, 'before': c}
+        # an unmeasurable cadence (one or two words) is left alone: new takes of a single
+        # word are where XTTS hallucinates the most ("Chaussures." -> "C'est un homme")
+        if c is None or cadence.falls(c):
+            entry.update(after=c, take=0, takes=0)
+            asr_jsonl_append(cadence_log, entry)
+            return
+        shutil.copyfile(wav, _variant(wav, 'cad0'))
+        best = (cadence.rank(c), 0, c)
+        drawn = 0
+        for k in range(1, cadence.MAX_TAKES + 1):
+            take = _variant(wav, f'cad{k}')
+            if not _valid_take(take):
+                tts_manager.engine.params['seed_offset'] = 104729 * k
+                ok, err = tts_manager.convert_sentence2audio(take, sentence, block_voice=block_voice)
+                tts_manager.engine.params['seed_offset'] = 0
+                if not ok:
+                    continue
+            drawn = k
+            ck = cadence.measure(take)
+            if cadence.rank(ck) < best[0]:
+                best = (cadence.rank(ck), k, ck)
+            if cadence.falls(ck):
+                break
+        if best[1]:
+            shutil.copyfile(_variant(wav, f'cad{best[1]}'), wav)
+        entry.update(after=best[2], take=best[1], takes=drawn)
+        asr_jsonl_append(cadence_log, entry)
+        print(f"[cadence] ch {ch_num} {kind} troncon {j} : ne descendait pas {c} -> "
+              f"{'essai ' + str(best[1]) if best[1] else 'original garde'} sur {drawn}, "
+              f"{'DESCEND' if cadence.falls(best[2]) else 'ne descend toujours pas'} {best[2]}", flush=True)
+
+    def _gen_takes(items:list[dict], ks:range, k_part:int, label:str)->list[dict]:
+        # repair takes with new seeds; takes already on disk (interrupted run) are reused
+        tts = None
+        takes = []
+        for i, b in enumerate(items, 1):
+            _, block = by_id[b['block_id']]
+            sentence = block['sentences'][b['j']].strip()
+            block_voice = block.get('voice') or session.get('voice')
+            for k in ks:
+                take = _variant(b['wav'], f'take{k}')
+                if not _valid_take(take):
+                    if tts is None:
+                        tts = TTSManager(session)
+                    tts.engine.params['seed_offset'] = 7919 * k
+                    ok, err = tts.convert_sentence2audio(take, sentence, block_voice=block_voice)
+                    if not ok:
+                        continue
+                takes.append({'wav': take, 'text': b['text'], 'orig': b['wav'], 'stage': label})
+            print(f'[verif] partie {k_part} {label} {i}/{len(items)} : {len(ks)} essais prets', flush=True)
+        if tts is not None:
+            tts.engine.params['seed_offset'] = 0
+            unload_tts_manager(tts)
+        return takes
+
+    def _repair(bad:list[dict], k_part:int, again:set)->tuple[int, set]:
+        """Repairs the confirmed bad chunks of one part. Returns (repaired count, touched chapters)."""
+        attempted = {r.get('wav') for r in asr_verifier.repairs()}
+        if again:
+            bad = [b for b in bad if (b['ch_num'], b['j']) in again]
+            ks = range(AsrVerifier.REPAIR_TAKES + 1, AsrVerifier.REPAIR_TAKES + 1 + again_takes)
+            print(f'[verif] seconde chance manuelle : {len(bad)} troncon(s), {again_takes} nouveaux essais chacun', flush=True)
+        else:
+            # a chunk already through a repair keeps its best take, the deterministic seeds
+            # would only draw the same takes again
+            bad = [b for b in bad if b['wav'] not in attempted]
+            ks = range(1, AsrVerifier.REPAIR_TAKES + 1)
+        if not bad:
+            return 0, set()
+        kinds = {}
+        for b in bad:
+            _, block = by_id[b['block_id']]
+            kinds[b['wav']] = cadence.cadence_targets(block['sentences']).get(b['j'])
+        takes = _gen_takes(bad, ks, k_part, 'reparation')
+        # the current take is a candidate too: cutting its babbling tail may be the repair
+        for b in bad:
+            orig_copy = _variant(b['wav'], 'take0')
+            shutil.copyfile(b['wav'], orig_copy)
+            takes.append({'wav': orig_copy, 'text': b['text'], 'orig': b['wav'], 'stage': 'original'})
+        # titles / chapter ends: the cadence takes drawn during the synthesis are candidates too
+        for b in bad:
+            if kinds[b['wav']]:
+                for k in range(0, cadence.MAX_TAKES + 1):
+                    cad = _variant(b['wav'], f'cad{k}')
+                    if _valid_take(cad):
+                        takes.append({'wav': cad, 'text': b['text'], 'orig': b['wav'], 'stage': 'cadence'})
+        asr_verifier.score_takes(takes)
+        second = set()
+        if not again:
+            # automatic second chance: still far from the text after the first takes
+            def _best_cer(b):
+                return min((t['cer'] for t in takes if t['orig'] == b['wav'] and 'cer' in t), default=1.0)
+            late = [b for b in bad if _best_cer(b) > AsrVerifier.SECOND_CHANCE_CER]
+            if late:
+                print(f'[verif] partie {k_part} : seconde chance automatique pour {len(late)} troncon(s), '
+                      f'{AsrVerifier.SECOND_CHANCE_TAKES} essais chacun', flush=True)
+                ks2 = range(AsrVerifier.REPAIR_TAKES + 1, AsrVerifier.REPAIR_TAKES + 1 + AsrVerifier.SECOND_CHANCE_TAKES)
+                takes2 = _gen_takes(late, ks2, k_part, 'seconde chance')
+                asr_verifier.score_takes(takes2)
+                takes += takes2
+                second = {b['wav'] for b in late}
+        repaired = 0
+        touched = set()
+        for b in bad:
+            cands = [t for t in takes if t['orig'] == b['wav'] and 'cer' in t]
+            kind = kinds[b['wav']]
+            if kind:
+                for t in cands:
+                    t['cadence'] = cadence.measure(t['wav'])
+                best = cadence.choose_take(cands, asr_confirm_cer)
+            else:
+                best = min(cands, key=lambda t: t['cer']) if cands else None
+            fixed = best is not None and best['cer'] < b['cer']
+            hyps2 = [t['asr'] for t in cands if t['stage'] == 'seconde chance']
+            probable_fp = b['wav'] in second and same_transcription(hyps2) and not (fixed and best['cer'] <= asr_confirm_cer)
+            if fixed:
+                if os.path.abspath(best['wav']) != os.path.abspath(b['wav']):
+                    shutil.copyfile(best['wav'], b['wav'])
+                repaired += 1
+                touched.add(b['ch_num'])
+                asr_verifier.record_result(b['wav'], best['cer'], best['asr'])
+            if again or b['wav'] in second:
+                print(f"[verif] seconde chance ch {b['ch_num']} troncon {b['j']} : CER {b['cer']:.2f} -> "
+                      f"{best['cer'] if best else float('nan'):.2f} " + ('REPARE' if fixed else 'inchange')
+                      + (' (probable faux positif de Whisper)' if probable_fp else '') + f" | {best['asr'] if best else ''}", flush=True)
+            asr_verifier.record_repair({
+                'wav': b['wav'], 'ch_num': b['ch_num'], 'j': b['j'], 'text': b['text'], 'before_cer': b['cer'], 'before_asr': b['asr'],
+                'after_cer': best['cer'] if best else None, 'after_asr': best['asr'] if best else None, 'fixed': fixed,
+                'second_chance': b['wav'] in second or bool(again), 'probable_false_positive': probable_fp,
+                'kind': kind, 'cadence': best.get('cadence') if best else None, 'part': k_part
+            })
+            for t in cands:
+                if t['stage'] != 'cadence' and os.path.exists(t['wav']):
+                    os.remove(t['wav'])
+        return repaired, touched
+
+    def _cadence_whisper_pass(part:list[int], k_part:int)->None:
+        # titles / chapter ends retaken for their cadence during the synthesis: every take is
+        # transcribed and the kept one is the most falling of those Whisper accepts
+        groups = []
+        for ch in part:
+            block = kept[ch - 1]
+            for j, kind in cadence.cadence_targets(block['sentences']).items():
+                wav = os.path.join(session['sentences_dir'], block['id'], f'{j}.{default_audio_proc_format}')
+                cads = [_variant(wav, f'cad{k}') for k in range(0, cadence.MAX_TAKES + 1) if _valid_take(_variant(wav, f'cad{k}'))]
+                if cads:
+                    text = ' '.join(SML_TAG_PATTERN.sub(' ', block['sentences'][j]).split())
+                    groups.append((ch, j, kind, wav, [{'wav': c, 'text': text, 'orig': wav} for c in cads]))
+        if not groups:
+            return
+        print(f'[cadence] partie {k_part} : Whisper sur les prises de {len(groups)} titre(s)/fin(s) reprises pour l\'intonation', flush=True)
+        asr_verifier.score_takes([t for g in groups for t in g[4]])
+        for ch, j, kind, wav, cands in groups:
+            for t in cands:
+                t['cadence'] = cadence.measure(t['wav'])
+            best = cadence.choose_take(cands, asr_confirm_cer)
+            if best is None:
+                continue
+            shutil.copyfile(best['wav'], wav)
+            asr_verifier.record_result(wav, best['cer'], best['asr'])
+            print(f"[cadence] ch {ch} {kind} troncon {j} : prise {os.path.basename(best['wav'])} CER {best['cer']:.3f} "
+                  f"{'DESCEND' if cadence.falls(best['cadence']) else 'ne descend pas'}", flush=True)
+
+    def _parts_state_save()->None:
+        with open(parts_state_path, 'w', encoding='utf-8') as f:
+            json.dump(parts_state, f, ensure_ascii=False, indent=1)
+
+    def _delivery_name()->str:
+        title = os.environ.get('E2A_DELIVERY_NAME') or (session.get('metadata') or {}).get('title') or Path(session.get('final_name') or 'audiobook').stem
+        title = unicodedata.normalize('NFKD', title)
+        title = ''.join(c for c in title if not unicodedata.combining(c))
+        return ''.join('_' if c in '<>:"/\\|?*' else c for c in title).strip(' .')
+
+    def _deliver(path:str)->str|None:
+        # copy of a finished file to the delivery folder (E2A_DELIVERY_DIR), if any
+        dest_dir = os.environ.get('E2A_DELIVERY_DIR')
+        if not (dest_dir and path and os.path.exists(path)):
+            return None
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, os.path.basename(path))
+            shutil.copyfile(path, dest)
+            print(f'[livraison] {dest}', flush=True)
+            return dest
+        except OSError as e:
+            print(f'[livraison] copie impossible de {path} : {e}')
+            return None
+
+    def _correct_part(k_part:int, again:set|None=None)->bool:
+        """Correction of one part of the book, as soon as its last chapter is synthesised:
+        Whisper check of its chunks, repairs (+ automatic second chance), chapters rebuilt
+        with their silences, progressive export, one chaptered m4b of the part delivered."""
+        nonlocal tts_manager
+        part = parts[k_part - 1]
+        again = again or set()
+        t0 = time.time()
+        print(f"\n[verif] ===== CORRECTION DE LA PARTIE {k_part}/{len(parts)} : chapitres {part[0]} a {part[-1]} =====", flush=True)
+        show_alert(session_id, {'type': 'info', 'msg': f'Part {k_part}/{len(parts)}: Whisper check and repairs of chapters {part[0]} to {part[-1]}…'})
+        if asr_verifier:
+            asr_verifier.stop_watcher()
+        unload_tts_manager(tts_manager)
+        tts_manager = None
+        repaired, touched, n_bad = 0, set(), 0
+        if asr_verifier and not again:
+            _cadence_whisper_pass(part, k_part)
+        if asr_verifier:
+            part_ids = {kept[ch - 1]['id'] for ch in part}
+            bad = asr_verifier.verify_on_gpu(block_ids=part_ids)
+            for b in bad:
+                b['ch_num'] = by_id[b['block_id']][0]
+            n_bad = len(bad)
+            print(f'[verif] partie {k_part} : {n_bad} troncon(s) confirme(s) au-dessus de {asr_confirm_cer * 100:.0f} % de CER', flush=True)
+            repaired, touched = _repair(bad, k_part, again)
+        # final cadence of the titles / chapter ends of the part, for the report
+        cad_final = []
+        for ch in part:
+            block = kept[ch - 1]
+            for j, kind in cadence.cadence_targets(block['sentences']).items():
+                wav = os.path.join(session['sentences_dir'], block['id'], f'{j}.{default_audio_proc_format}')
+                c = cadence.measure(wav)
+                cad_final.append({'ch_num': ch, 'j': j, 'kind': kind, 'falls': cadence.falls(c), 'cadence': c,
+                                  'text': ' '.join(SML_TAG_PATTERN.sub(' ', block['sentences'][j]).split())})
+                for k in range(0, cadence.MAX_TAKES + 1):
+                    cad = _variant(wav, f'cad{k}')
+                    if os.path.exists(cad):
+                        os.remove(cad)
+        # every chapter of the part is rebuilt (repairs, chapter silences) and exported
+        for n, ch in enumerate(part, 1):
+            if again and ch not in touched:
+                continue
+            block = kept[ch - 1]
+            ch_file = os.path.join(session['chapters_dir'], f"{block['id']}.{default_audio_proc_format}")
+            if not combine_audio_sentences(session_id, ch_file, block['id'], len(block['sentences'])):
+                return False
+            if exporter:
+                exporter.add_chapter(ch, ch_file, chapter_title_of(block['sentences'], ch))
+            print(f'[verif] partie {k_part} reconstruction {n}/{len(part)}', flush=True)
+        m4b = None
+        if exporter:
+            name = f'{_delivery_name()} - partie {k_part} sur {len(parts)} (chapitres {part[0]} a {part[-1]}).m4b'
+            title = f"{exporter.book_title} — partie {k_part} sur {len(parts)} (chapitres {part[0]} à {part[-1]})"
+            m4b = exporter.export_range(part[0], part[-1], os.path.join(session['audiobooks_dir'], f'{exporter.stem} (parties)', name), title)
+        delivered = _deliver(m4b)
+        not_falling = [c for c in cad_final if not c['falls']]
+        if again:
+            done = parts_state['done'].setdefault(str(k_part), {'chapters': [part[0], part[-1]], 'bad': 0, 'repaired': 0})
+            done['again_repaired'] = done.get('again_repaired', 0) + repaired
+            done.update(m4b=delivered or m4b, cadence_targets=len(cad_final),
+                        cadence_not_falling=[[c['ch_num'], c['j'], c['kind'], c['text'][:80]] for c in not_falling])
+            _parts_state_save()
+            _deliver(_write_verification_report())
+            print(f'[verif] seconde chance partie {k_part} : {repaired} troncon(s) repare(s)', flush=True)
+            return True
+        parts_state['done'][str(k_part)] = {
+            'chapters': [part[0], part[-1]], 'bad': n_bad, 'repaired': repaired, 'm4b': delivered or m4b,
+            'cadence_targets': len(cad_final), 'cadence_not_falling': [[c['ch_num'], c['j'], c['kind'], c['text'][:80]] for c in not_falling],
+            'minutes': round((time.time() - t0) / 60, 1), 'finished': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        _parts_state_save()
+        _deliver(_write_verification_report())
+        print(f"[verif] === PARTIE {k_part}/{len(parts)} TERMINEE : chapitres {part[0]} a {part[-1]}, {repaired}/{n_bad} troncon(s) repare(s), "
+              f"{len(cad_final) - len(not_falling)}/{len(cad_final)} titres/fins descendants, {(time.time() - t0) / 60:.1f} min -> {delivered or m4b} ===", flush=True)
+        if asr_verifier and k_part < len(parts) and not again:
+            asr_verifier.start_watcher()
+        return True
+
+    def _after_chapter(ch_num:int)->None:
+        k_part = part_of_last.get(ch_num)
+        if not k_part or str(k_part) in parts_state['done']:
+            return
+        # the correction improves the book, it must never cost the hours of synthesis
+        try:
+            if not _correct_part(k_part):
+                print(f'[verif] partie {k_part} : un chapitre repare n\'a pas pu etre recombine, chapitres originaux gardes')
+        except Exception as e:
+            DependencyError(e)
+            print(f'[verif] correction de la partie {k_part} interrompue par une erreur : {e}')
+
+    def _write_verification_report()->str|None:
+        if not asr_verifier:
+            return None
+        try:
+            stem = Path(session.get('final_name') or 'audiobook').stem
+            path = os.path.join(session['audiobooks_dir'], f'{stem} - verification Whisper.txt')
+            # one entry per chunk: first verdict before any repair, last attempt after
+            merged = {}
+            for r in asr_verifier.repairs():
+                key = r.get('wav') or (r['ch_num'], r['j'])
+                if key in merged:
+                    first = merged[key]
+                    r = dict(r, before_asr=first['before_asr'], before_cer=first['before_cer'], fixed=first['fixed'] or r['fixed'],
+                             after_asr=r['after_asr'] if r['fixed'] or not first['fixed'] else first['after_asr'],
+                             after_cer=r['after_cer'] if r['fixed'] or not first['fixed'] else first['after_cer'])
+                merged[key] = r
+            entries = sorted(merged.values(), key=lambda r: (r['ch_num'], r['j']))
+            fps = [r for r in entries if r.get('probable_false_positive')]
+            remaining = [r for r in entries if (r.get('after_cer') if r.get('fixed') else r['before_cer']) > asr_confirm_cer and not r.get('probable_false_positive')]
+            done = parts_state['done']
+            lines = [f"Verification Whisper : {len(entries)} troncon(s) faux, {sum(1 for r in entries if r['fixed'])} repare(s), "
+                     f"{len(fps)} probable(s) faux positif(s) de Whisper, {len(remaining)} defaut(s) restant(s) a ecouter",
+                     f"Parties corrigees : {', '.join(sorted(done, key=int)) or 'aucune'} sur {len(parts)}", '']
+            for k in sorted(done, key=int):
+                d = done[k]
+                lines.append(f"Partie {k} (chapitres {d['chapters'][0]} a {d['chapters'][1]}) : {d['repaired']}/{d['bad']} repare(s), "
+                             f"titres/fins ne descendant pas : {len(d['cadence_not_falling'])}/{d['cadence_targets']}")
+                for ch, j, kind, text in d['cadence_not_falling']:
+                    lines.append(f'    intonation : chapitre {ch}, {kind} (troncon {j}) : {text}')
+            lines.append('')
+            if remaining:
+                lines.append('A ECOUTER (defauts restants) :')
+                for r in remaining:
+                    lines.append(f"  chapitre {r['ch_num']}, troncon {r['j']} : {r['text'][:90]}")
+                lines.append('')
+            for r in entries:
+                status = 'REPARE' if r['fixed'] else 'NON REPARE'
+                if r.get('probable_false_positive'):
+                    status += ' - probable faux positif (Whisper entend toujours la meme chose)'
+                elif r.get('second_chance'):
+                    status += ' (seconde chance)'
+                lines.append(f"Chapitre {r['ch_num']}, troncon {r['j']} : {status}")
+                lines.append(f"  texte  : {r['text']}")
+                lines.append(f"  avant  : {r['before_asr']}  (CER {r['before_cer']})")
+                if r['after_asr'] is not None:
+                    lines.append(f"  apres  : {r['after_asr']}  (CER {r['after_cer']})")
+                lines.append('')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            print(f'Verification report: {path}')
+            return path
+        except Exception as e:
+            print(f'verification report error: {e}')
+            return None
+
     session = context.get_session(session_id)
     if not (session and session.get('id', False)):
         return False
     tts_manager = None
+    asr_verifier = None
     conversion = False
     try:
         if session['cancellation_requested']:
@@ -2865,6 +3394,58 @@ def convert_chapters2audio(session_id:str)->bool:
         ch_num = 0
         last_save_time = time.monotonic()
         baseline_initialized = False
+        # every finished chapter is exported right away to "<book> (en cours)"
+        exporter = None
+        if session.get('progressive_export', True) and session.get('audiobooks_dir'):
+            try:
+                exporter = ProgressiveExporter(session)
+            except Exception as e:
+                print(f'Progressive export disabled: {e}')
+        # Whisper verification of the chunks (CPU watcher during the run, GPU repair at the end)
+        if session.get('asr_check', True) and session['tts_engine'] in (TTS_ENGINES['XTTS'], TTS_ENGINES['F5TTS']):
+            try:
+                asr_verifier = AsrVerifier(session, models_dir)
+                if asr_verifier.enabled:
+                    asr_verifier.start_watcher()
+                else:
+                    print('Whisper models not found in models/, verification disabled')
+                    asr_verifier = None
+            except Exception as e:
+                print(f'Whisper verification disabled: {e}')
+                asr_verifier = None
+        # the book is finished part by part (E2A_REPAIR_PARTS, 3 by default, whole chapters of
+        # about the same number of chunks): as soon as the last chapter of a part is
+        # synthesised, the part is checked by Whisper, repaired, rebuilt and delivered as its
+        # own m4b, then the synthesis goes on. Finished parts are recorded so a resumed run
+        # never does them again.
+        kept = [b for b in blocks if b['keep'] and b['text'].strip()]
+        by_id = {b['id']: (n, b) for n, b in enumerate(kept, start=1)}
+        parts = split_in_parts([_count_sentences(b['sentences']) for b in kept], int(os.environ.get('E2A_REPAIR_PARTS', '3')))
+        part_of_last = {p[-1]: k for k, p in enumerate(parts, start=1)}
+        asr_confirm_cer = ASR_CONFIRM_CER
+        cadence_on = os.environ.get('E2A_CADENCE', '1') != '0' and session['tts_engine'] in (TTS_ENGINES['XTTS'], TTS_ENGINES['F5TTS'])
+        cadence_log = os.path.join(session['process_dir'], 'cadence.jsonl')
+        # E2A_REPAIR_AGAIN=<file of "ch_num j" lines>: manual second chance for chosen chunks,
+        # with new seeds, once every part is done
+        again_file = os.environ.get('E2A_REPAIR_AGAIN')
+        again_takes = int(os.environ.get('E2A_REPAIR_AGAIN_TAKES', '8'))
+        again = set()
+        if again_file and os.path.exists(again_file):
+            for line in open(again_file, encoding='utf-8-sig'):
+                if line.split() and not line.startswith('#'):
+                    again.add(tuple(int(x) for x in line.split()[:2]))
+        parts_state_path = os.path.join(session['process_dir'], 'asr_parts_done.json')
+        parts_state = {'parts': parts, 'done': {}}
+        try:
+            with open(parts_state_path, encoding='utf-8-sig') as f:
+                saved_state = json.load(f)
+            if saved_state.get('parts') == parts:
+                parts_state['done'] = saved_state.get('done', {})
+            else:
+                print('[verif] decoupage en parties modifie : les parties deja faites seront refaites')
+        except (OSError, ValueError):
+            pass
+        print(f"[verif] {len(parts)} partie(s) : " + ', '.join(f'{k} = chapitres {p[0]} a {p[-1]}' + (' (deja faite)' if str(k) in parts_state['done'] else '') for k, p in enumerate(parts, 1)), flush=True)
         msg = (f'---------<br/>'
                f"{session['filename_noext']}<br/>"
                f"A total of {total_chapters} {'block' if total_chapters <= 1 else 'blocks'} "
@@ -2900,9 +3481,14 @@ def convert_chapters2audio(session_id:str)->bool:
                         missing_sentences = _check_block_sentences(block_id, sentences)
                         if not missing_sentences:
                             print(f'Chapter {ch_num} (block {x}) — has all sentences')
+                            if exporter and not exporter.has(ch_num):
+                                exporter.add_chapter(ch_num, chapter_audio_file, chapter_title_of(sentences, ch_num))
+                            if asr_verifier:
+                                asr_verifier.enqueue_chapter(block_id, ch_num, _asr_chunks(block_id, sentences))
                             cnt = len(valid_idx)
                             global_sent += cnt
                             t.update(cnt)
+                            _after_chapter(ch_num)
                             continue
                         show_alert(session_id, {'type': 'warning', 'msg': f'Block {x} has {len(missing_sentences)} missing audio files, reconverting…'})
                         _reset_chapter_file(block_id)
@@ -2921,6 +3507,7 @@ def convert_chapters2audio(session_id:str)->bool:
                 save_db_stamp(session_id)
                 converted = False
                 block_voice = block.get('voice') or session.get('voice')
+                cad_targets = cadence.cadence_targets(sentences) if cadence_on else {}
                 for j in range(block_len):
                     if session['cancellation_requested']:
                         msg = 'Conversion Cancelled'
@@ -2931,10 +3518,15 @@ def convert_chapters2audio(session_id:str)->bool:
                             if j == start_sentence and start_sentence > 0:
                                 show_alert(session_id, {'type': 'info', 'msg': f'*** Resuming from sentence {global_sent} ***'})
                             sentence_file = os.path.join(block_dir, f'{j}.{default_audio_proc_format}')
+                            if tts_manager is None:
+                                # unloaded by the correction of the previous part
+                                tts_manager = TTSManager(session)
                             run, error = tts_manager.convert_sentence2audio(sentence_file, sentence, block_voice=block_voice)
                             if not run:
                                 show_alert(session_id, {'type': 'warning', 'msg': error})
                                 return False
+                            if j in cad_targets:
+                                _cadence_retakes(ch_num, j, cad_targets[j], sentence_file, sentence, block_voice)
                             converted = True
                             blocks_current['sentence_resume'] = j
                             now = time.monotonic()
@@ -2964,6 +3556,26 @@ def convert_chapters2audio(session_id:str)->bool:
                     if not combine_audio_sentences(session_id, chapter_audio_file, block_id, block_len):
                         show_alert(session_id, {'type': 'warning', 'msg': 'combine_audio_sentences() failed!'})
                         return False
+                    if exporter:
+                        exporter.add_chapter(ch_num, chapter_audio_file, chapter_title_of(sentences, ch_num))
+                if asr_verifier:
+                    asr_verifier.enqueue_chapter(block_id, ch_num, _asr_chunks(block_id, sentences))
+                # the chapter is complete: a resume starts after it (resuming on its last
+                # sentence would synthesise it again over a repaired or cadence-chosen take)
+                blocks_current['block_resume'] = x + 1
+                blocks_current['sentence_resume'] = 0
+                session['blocks_current'] = blocks_current
+                save_db_stamp(session_id)
+                _after_chapter(ch_num)
+            if asr_verifier and again:
+                # manual second chance on chosen chunks, part by part
+                for k_part in range(1, len(parts) + 1):
+                    try:
+                        _correct_part(k_part, again)
+                    except Exception as e:
+                        DependencyError(e)
+                        print(f'[verif] seconde chance de la partie {k_part} interrompue : {e}')
+            _deliver(_write_verification_report())
             #blocks_current['block_resume'] = 0
             #blocks_current['sentence_resume'] = 0
             session['blocks_current'] = blocks_current
@@ -2980,8 +3592,58 @@ def convert_chapters2audio(session_id:str)->bool:
         # every exit that is not a completed conversion drops the engine and evicts
         # its models: there are ten early `return False` paths in here, so a finally
         # is the only way to cover them all.
+        if asr_verifier is not None and asr_verifier.proc is not None:
+            asr_verifier.stop_watcher()
         if not conversion:
             unload_tts_manager(tts_manager)
+
+def deliver_final_files(session:Any, exported_files:list[str])->None:
+    # E2A_DELIVERY_DIR: the finished audiobook and its Whisper report are copied there
+    dest_dir = os.environ.get('E2A_DELIVERY_DIR')
+    if not dest_dir:
+        return
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        stem = Path(session.get('final_name') or 'audiobook').stem
+        report = os.path.join(session['audiobooks_dir'], f'{stem} - verification Whisper.txt')
+        for path in list(exported_files) + [report]:
+            if path and os.path.exists(path):
+                shutil.copyfile(path, os.path.join(dest_dir, os.path.basename(path)))
+                print(f'[livraison] {os.path.join(dest_dir, os.path.basename(path))}', flush=True)
+    except OSError as e:
+        print(f'[livraison] copie impossible : {e}')
+
+def split_in_parts(sizes:list[int], n_parts:int)->list[list[int]]:
+    """Chapter numbers (1-based) grouped in n_parts runs of whole chapters of about the
+    same total size (number of chunks): a chapter goes to the part where its middle falls."""
+    n_parts = max(1, n_parts)
+    total = max(1, sum(sizes))
+    parts = [[] for _ in range(n_parts)]
+    acc = 0
+    for n, size in enumerate(sizes, start=1):
+        parts[min(n_parts - 1, int((acc + size / 2) * n_parts / total))].append(n)
+        acc += size
+    return [p for p in parts if p]
+
+CHAPTER_LEAD_IN_S = 1.0
+CHAPTER_TAIL_S = 1.5
+
+def chapter_silence_files(work_dir:str, model_file:str|Path)->tuple[str|None, str|None]:
+    # silences in the exact format of the sentence files, so the concat stays a stream copy
+    try:
+        import soundfile as sf
+        import numpy as np
+        info = sf.info(str(model_file))
+        files = []
+        for name, seconds in (('lead_in', CHAPTER_LEAD_IN_S), ('tail', CHAPTER_TAIL_S)):
+            path = os.path.join(work_dir, f'_chapter_{name}_{info.samplerate}_{info.channels}_{info.subtype}.{default_audio_proc_format}')
+            if not os.path.exists(path):
+                sf.write(path, np.zeros((int(seconds * info.samplerate), info.channels), dtype='float32'), info.samplerate, subtype=info.subtype)
+            files.append(path)
+        return files[0], files[1]
+    except Exception as e:
+        print(f'chapter_silence_files() error: {e}')
+        return None, None
 
 def combine_audio_sentences(session_id:str, file:str, block_id:str, sentence_count:int)->bool:
     try:
@@ -3010,11 +3672,19 @@ def combine_audio_sentences(session_id:str, file:str, block_id:str, sentence_cou
             return False
         concat_dir = session['process_dir']
         concat_list = os.path.join(concat_dir, 'concat_list_sentences.txt')
+        # silence around every chapter: players (VLC…) need a moment to open the audio
+        # output and eat the first syllable of a chapter starting at 0 s, and the listener
+        # needs a breath between two chapters
+        lead_in, tail = chapter_silence_files(concat_dir, selected_files[0])
         with open(concat_list, 'w') as f:
+            if lead_in:
+                f.write(f"file '{Path(lead_in).as_posix()}'\n")
             for path in selected_files:
                 if session['cancellation_requested']:
                     return False
                 f.write(f"file '{path.as_posix()}'\n")
+            if tail:
+                f.write(f"file '{Path(tail).as_posix()}'\n")
         result = assemble_audio_chunks(concat_list, file, session['is_gui_process'])
         if not result:
             error = 'combine_audio_sentences() FFmpeg concat failed.'
@@ -3026,6 +3696,43 @@ def combine_audio_sentences(session_id:str, file:str, block_id:str, sentence_cou
     except Exception as e:
         DependencyError(e)
         return False
+
+CHAPTER_EXCERPT_CHARS = 38
+
+def chapter_title_of(sentences:list[str], ch_num:int|None=None)->str:
+    # the chapter title is its heading (the first spoken line, closed by a [pause]); a short
+    # heading followed by a second one (part title merged by split_spine(), series name then
+    # subtitle: "Doux chagrins" / "Jadis, il y a fort longtemps…") is completed with it.
+    # A chapter without heading is named "Chapitre N — first words…": its first sentence
+    # would make an unreadable chapter name. The name is only metadata, nothing is spoken.
+    def _clean(s:str)->str:
+        s = ' '.join(SML_TAG_PATTERN.sub(' ', s).split()).lstrip(' .;:…').rstrip(' .;:')
+        return s[:1].upper() + s[1:]
+
+    spoken = [s for s in sentences if any(c.isalnum() for c in SML_TAG_PATTERN.sub(' ', s))]
+
+    def _is_heading(k:int)->bool:
+        # the last chunk ends with the [pause] closing the chapter, it is not a heading
+        return k < len(spoken) - 1 and bool(re.search(r'\[pause\]', spoken[k]))
+
+    if not spoken:
+        return f'Chapitre {ch_num}' if ch_num else ''
+    if _is_heading(0) or ch_num is None:
+        title = _clean(spoken[0])
+        if len(title) < 40 and _is_heading(0) and _is_heading(1):
+            title = f'{title} — {_clean(spoken[1])}'
+        return title
+    return f'Chapitre {ch_num} — {chapter_excerpt(_clean(spoken[0]))}'
+
+def chapter_excerpt(text:str, max_chars:int=CHAPTER_EXCERPT_CHARS)->str:
+    # first words of a text, cut on a word boundary: "Zachary Ezra Rawlins est assis par…"
+    words = text.split()
+    out = []
+    for w in words:
+        if out and len(' '.join(out + [w])) > max_chars:
+            break
+        out.append(w)
+    return ' '.join(out).rstrip(' ,;:.!?…—-') + '…'
 
 def combine_audio_chapters(session_id:str)->list[str]|None:
     
@@ -3291,7 +3998,7 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 print(error)
                 return None
             chapter_files.append(fname)
-            chapter_titles.append(block['sentences'][0])
+            chapter_titles.append(chapter_title_of(block['sentences'], len(chapter_files)))
             chapter_positions.append(x)
         if len(chapter_files) == 0:
             print('No block files exist!')
@@ -3783,7 +4490,11 @@ def convert_ebook(args:dict)->tuple:
                     if voice_note:
                         msg += voice_note
                     print(msg)
-                    while True:
+                    # unattended runs (tools/run_resumable.py) answer through the environment
+                    choice = os.environ.get('E2A_RESUME_CHOICE', '').strip().lower()
+                    if choice in ('s', 'r', 'd'):
+                        print(f'[{choice}] chosen by E2A_RESUME_CHOICE')
+                    while choice not in ('s', 'r', 'd'):
                         choice = input("[s]kip / [r]esume / [d]elete and convert again: ").strip().lower()
                         if choice in ('s', 'r', 'd'):
                             break
@@ -3828,6 +4539,10 @@ def convert_ebook(args:dict)->tuple:
                                 session['voice'] = final_voice_file
                             else:
                                 error = f'VoiceExtractor.extract_voice() failed! {msg}'
+                        else:
+                            # resumed session: keep using the voice prepared by the first run,
+                            # the same audio (and path) as the chapters already converted
+                            session['voice'] = final_voice_file
             if error is None:
                 if prepare_dirs(session_id):
                     session['ebook'] = os.path.join(session['process_dir'], ebook_file)
@@ -4140,6 +4855,7 @@ def finalize_audiobook(session_id:str)->tuple:
         if exported_files is None:
             return _fail('combine_audio_chapters() error: exported_files not created!')
         session['audiobook'] = exported_files[-1]
+        deliver_final_files(session, exported_files)
         if not session['is_gui_process'] and session['abs_url'] and session['abs_api_token'] and session['abs_library']:
             from lib.classes.audiobookshelf import fetch_libraries, upload_to_abs
             try:
@@ -4291,6 +5007,12 @@ def unload_tts_manager(tts_manager:Any)->None:
         if tts_manager is not None:
             engine = getattr(tts_manager, 'engine', None)
             keys = [getattr(engine, attr, None) for attr in ('tts_key', 'tts_zs_key')]
+            # engines driving a worker process (F5-TTS) must stop it to free the GPU
+            if engine is not None and hasattr(engine, 'close'):
+                try:
+                    engine.close()
+                except Exception:
+                    pass
             tts_manager.engine = None
             engine = None
             for key in keys:

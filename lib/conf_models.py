@@ -13,7 +13,8 @@ TTS_ENGINES = {
     "FAIRSEQ": "fairseq",
     "GLOWTTS": "glowtts",
     "TACOTRON": "tacotron",
-    "YOURTTS": "yourtts"
+    "YOURTTS": "yourtts",
+    "F5TTS": "f5tts"
 }
 
 TTS_VOICE_CONVERSION = {
@@ -86,8 +87,14 @@ default_engine_settings = {
         "top_k": 40,
         "top_p": 0.95,
         "speed": 1.0,
-        #"gpt_cond_len": 512,
+        # conditioning: 30 s of reference in 4 s chunks gives the GPT the narration style,
+        # the coqui defaults only look at the first 6 s
+        "gpt_cond_len": 30,
+        "gpt_cond_chunk_len": 4,
+        "max_ref_length": 60,
         #"gpt_batch_size": 1,
+        # get_sentences() already cuts at prosodic boundaries under the language limit;
+        # coqui's own splitting would glue its pieces back with no pause
         "enable_text_splitting": False,
         "files": ['config.json', 'model.pth', 'vocab.json', 'ref.wav'],
         "voice": default_speaker,
@@ -285,5 +292,20 @@ default_engine_settings = {
         "voice": None,
         "voices": {"Machinella-5": "female-en-5", "ElectroMale-2": "male-en-2", 'Machinella-4': 'female-pt-4\n', 'ElectroMale-3': 'male-pt-3\n'},
         "rating": {"VRAM": 1, "CPU": 5, "RAM": 1, "Realism": 2}
+    },
+    TTS_ENGINES['F5TTS']: {
+        # runs in python_env_f5 (tools/install_f5tts.ps1) through a worker process
+        "languages": {"fra": "fr"},
+        "samplerate": 24000,
+        "nfe_step": 32,
+        "cfg_strength": 2.0,
+        "sway_sampling_coef": -1.0,
+        "speed": 1.0,
+        # one generation covers ~12 s next to a ~10 s reference: shorter chunks than XTTS
+        "max_chars": 160,
+        "files": [],
+        "voice": None,
+        "voices": {},
+        "rating": {"VRAM": 3, "CPU": 1, "RAM": 4, "Realism": 5}
     }
 }
