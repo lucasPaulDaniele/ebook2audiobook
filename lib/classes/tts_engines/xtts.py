@@ -114,6 +114,17 @@ class XTTS(TTSUtils, TTSRegistry, name='xtts'):
             error = f'load_engine() error: {e}'
             raise RuntimeError(error) from e
 
+    def _conditioning_params(self)->dict:
+        # how much of the reference voice the GPT listens to; coqui's defaults only use its first 6 s
+        cfg = default_engine_settings[TTS_ENGINES['XTTS']]
+        params = {
+            'gpt_cond_len': int(self.session.get('xtts_gpt_cond_len') or cfg['gpt_cond_len']),
+            'gpt_cond_chunk_len': int(cfg['gpt_cond_chunk_len']),
+            'max_ref_length': int(cfg['max_ref_length'])
+        }
+        params['gpt_cond_chunk_len'] = min(params['gpt_cond_chunk_len'], params['gpt_cond_len'])
+        return params
+
     def convert(self, sentence_file:str, sentence:str, **kwargs)->tuple:
         try:
             import torch
@@ -153,7 +164,7 @@ class XTTS(TTSUtils, TTSRegistry, name='xtts'):
                             if self.speaker in default_engine_settings[TTS_ENGINES['XTTS']]['voices'].keys():
                                 self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.xtts_speakers[default_engine_settings[TTS_ENGINES['XTTS']]['voices'][self.speaker]].values()
                             else:
-                                self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.engine.get_conditioning_latents(audio_path=[self.params['current_voice']], load_sr=24000, sound_norm_refs=True)
+                                self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.engine.get_conditioning_latents(audio_path=[self.params['current_voice']], load_sr=24000, sound_norm_refs=True, **self._conditioning_params())
                             self.params['latent_embedding'][self.params['current_voice']] = self.params['gpt_cond_latent'], self.params['speaker_embedding']
                         result = False
                         try:
