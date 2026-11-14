@@ -153,6 +153,20 @@ class XTTS(NaturalNarration, TTSUtils, TTSRegistry, name='xtts'):
     # XTTS GPT produces 21.53 audio codes per second (22050 Hz / hop 1024)
     AUDIO_CODES_PER_S = 22050 / 1024
 
+    @staticmethod
+    def _model_text(text:str)->str:
+        """The text given to the model. XTTS sometimes reads a final full stop aloud ("...un
+        cachot point.", heard "point", "peint", "pointe"...). Without it (bench on 36 chunks of
+        La Mer sans Etoiles that had the defect, 2 seeds each): parasite words 53 % -> 0 %,
+        mean CER 9.2 % -> 2.0 %, falling sentence ends 44 % -> 62 %; on 36 chunks read well: parasites
+        3 % -> 0 %, CER 0.8 % -> 0.5 %, falling ends 49 % -> 64 %. Only this full stop goes:
+        "?", "!" and "..." keep their tune, and the pause after the chunk and its duration
+        check still use the full text."""
+        t = text.rstrip()
+        if t.endswith('.') and not t.endswith('..'):
+            return t[:-1].rstrip()
+        return text
+
     def _conditioning_params(self)->dict:
         cfg = default_engine_settings[TTS_ENGINES['XTTS']]
         params = {}
@@ -176,7 +190,7 @@ class XTTS(NaturalNarration, TTSUtils, TTSRegistry, name='xtts'):
         with torch.inference_mode():
             with torch.autocast(self.device, dtype=self.amp_dtype, enabled=(self.amp_dtype != torch.float32)):
                 result = self.engine.inference(
-                    text=text,
+                    text=self._model_text(text),
                     language=self.language_iso1,
                     gpt_cond_latent=self.params['gpt_cond_latent'],
                     speaker_embedding=self.params['speaker_embedding'],
